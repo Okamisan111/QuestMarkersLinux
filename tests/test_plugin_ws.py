@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Feed-WebSocket protocol integration tests (protocol v3) against the REAL
+"""Feed-WebSocket protocol integration tests (protocol v4) against the REAL
 production server code.
 
 tests/plugin/Harness.cs compiles plugin/src/WsServer.cs UNCHANGED (no Unity,
@@ -46,8 +46,23 @@ def check(name, passed, detail=""):
     print(f"  [{'PASS' if passed else 'FAIL'}] {name}" + (f": {detail}" if detail and not passed else ""))
 
 
-def proof(nonce):
-    return hmac.new(TOKEN.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+def server_proof(nonce):
+    """What the server must send as p: HMAC over the server-side domain."""
+    return hmac.new(TOKEN.encode(), ("server|" + nonce).encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def client_proof(nonce):
+    """What the client must answer as r: a DIFFERENT derivation, so echoing
+    the server's own p back does not authenticate."""
+    return hmac.new(TOKEN.encode(), ("client|" + nonce).encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def frame_stamp(feed_time):
+    """Per-frame tok stamp: HMAC over the frame's own timestamp."""
+    return hmac.new(TOKEN.encode(), str(feed_time).encode(),
+                    hashlib.sha256).hexdigest()
 
 
 def logged(sub):
@@ -57,8 +72,11 @@ def logged(sub):
 
 def build():
     if shutil.which("dotnet") is None:
-        print("SKIP: dotnet not installed (plugin WS tests need it) - test skipped, not failed")
-        sys.exit(0)
+        # Never "skip" a security battery silently: CI would stay green while
+        # the whole server-side auth/origin/deadline coverage ran zero checks.
+        print("FAIL: dotnet not installed - the plugin WS battery cannot run")
+        print("RESULT: FAIL (0/0)")
+        sys.exit(1)
     subprocess.run(["dotnet", "build", "tests/plugin/WsHarness.csproj", "-c", "Release", "-v", "q"],
                    cwd=ROOT, check=True)
 
@@ -95,8 +113,8 @@ async def read_challenge(ws):
 async def authenticate(ws):
     chal, raw, ok_shape = await read_challenge(ws)
     assert ok_shape, "malformed challenge"
-    assert proof(chal["n"]) == chal["p"], "server proof invalid"
-    await ws.send(json.dumps({"c": "auth", "r": proof(chal["n"])}))
+    assert server_proof(chal["n"]) == chal["p"], "server proof invalid"
+    await ws.send(json.dumps({"c": "auth", "r": client_proof(chal["n"])}))
 
 
 async def recv_frame(ws, timeout=3.0):
@@ -106,16 +124,37 @@ async def recv_frame(ws, timeout=3.0):
 async def test_full_auth():
     async with websockets.connect(URL, close_timeout=1) as ws:
         await authenticate(ws)
-        got = []
+        got, raws = [], []
         for _ in range(5):
-            f = await recv_frame(ws)
-            got.append(f)
-        check("authenticated client receives tok-stamped frames",
-              len(got) == 5 and all(f.get("tok") == TOKEN and "m" in f for f in got))
+            raw = await asyncio.wait_for(ws.recv(), timeout=3.0)
+            raws.append(raw)
+            got.append(json.loads(raw))
+        check("authenticated client receives stamped frames",
+              len(got) == 5 and all("m" in f for f in got))
+        check("frame stamp is HMAC over the frame timestamp, not the token",
+              all(f.get("tok") == frame_stamp(f.get("t")) for f in got)
+              and all(f.get("tok") != TOKEN for f in got))
+        check("token never appears in any frame on the wire",
+              all(TOKEN not in raw for raw in raws))
         check("server logs authenticated feed",
               logged("feed token verified via challenge"))
-    check("challenge frame never carries the token itself",
-          not logged(TOKEN), "token appeared in server log verbatim")
+
+
+async def test_reflection_rejected():
+    """A client that echoes the server's own proof must NOT be admitted -
+    the regression that made the v3 challenge authenticate nobody."""
+    async with websockets.connect(URL, close_timeout=1) as ws:
+        chal, _, ok_shape = await read_challenge(ws)
+        assert ok_shape
+        # zero token knowledge: send the server's own p back as the answer
+        await ws.send(json.dumps({"c": "auth", "r": chal["p"]}))
+        admitted = False
+        try:
+            await asyncio.wait_for(ws.recv(), timeout=3.0)
+            admitted = True
+        except ConnectionClosed:
+            admitted = False
+        check("echoed server proof is refused (no token knowledge)", not admitted)
 
 
 async def test_wrong_answer():
@@ -123,7 +162,7 @@ async def test_wrong_answer():
         chal, _, ok_shape = await read_challenge(ws)
         assert ok_shape
         # the server PROVED knowledge of the token (proof verifies)...
-        good_proof = proof(chal["n"]) == chal["p"]
+        good_proof = server_proof(chal["n"]) == chal["p"]
         # ...so answer with a WRONG proof on purpose:
         await ws.send(json.dumps({"c": "auth", "r": "deadbeef" * 8}))
         refused = False
@@ -152,17 +191,23 @@ async def test_missing_answer():
 
 
 async def test_origin_rejected():
-    rejected = False
+    """A browser-Origin handshake must be refused with HTTP 403 BEFORE the
+    upgrade. Only the status code counts: a server that answers 101 and then
+    drops the connection has accepted the handshake and must FAIL here."""
+    status = None
+    upgraded = False
     try:
         async with websockets.connect(URL, close_timeout=1,
                                       additional_headers={"Origin": "http://127.0.0.1:8080"}) as ws:
+            upgraded = True
             await asyncio.wait_for(ws.recv(), timeout=3.0)
     except InvalidStatus as e:
-        rejected = e.response.status_code == 403
+        status = e.response.status_code
     except ConnectionClosed:
-        rejected = True
+        status = None
     check("browser Origin handshake rejected with 403",
-          rejected and logged("browser Origin header present"))
+          status == 403 and not upgraded and logged("browser Origin header present"),
+          f"status={status} upgraded={upgraded}")
 
 
 def test_oversized_headers():
@@ -240,11 +285,34 @@ async def test_pending_client_cannot_evict():
           f"frames={frames} evicted={evicted} healthy={healthy}")
 
 
+def plugin_frame_head_unconditional():
+    """BuildFrame must write the frame head BEFORE the projection block.
+
+    The head (t/v/cfg/tok) used to live inside `if (camera != null &&
+    targets != null)`, so every idle frame - exactly what the auto-hide timer
+    and the toggle key produce - started with a comma:  ,"m":[]}
+    That is not JSON. The overlay dropped those frames silently, the feed
+    timestamp stopped advancing, and the last markers stayed frozen on screen
+    for the full 1 s staleness window before the display cleared.
+    """
+    src = open(os.path.join(ROOT, "plugin", "src", "Plugin.cs"),
+               encoding="utf-8").read()
+    body = src[src.index("private void BuildFrame"):]
+    body = body[:body.index("\n    }")]
+    head = body.find('sb.Append("{\\"t\\":"')
+    cond = body.find("if (camera != null && targets != null)")
+    tail = body.find('sb.Append(",\\"m\\":["')
+    check("BuildFrame writes the frame head unconditionally (idle frames parse)",
+          -1 < head < cond < tail, f"head@{head} cond@{cond} m-array@{tail}")
+
+
 async def main():
     build()
+    plugin_frame_head_unconditional()
     proc = start_server()
     try:
         await test_full_auth()
+        await test_reflection_rejected()
         await test_wrong_answer()
         await test_missing_answer()
         await test_origin_rejected()

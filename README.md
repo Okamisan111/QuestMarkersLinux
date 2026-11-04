@@ -1,288 +1,471 @@
+<div align="center">
+
 # QuestMarkersLinux
 
-System-wide quest-marker overlay for **SPT (Single Player Tushonka)** on
-Linux/Wine/Proton: a transparent on-screen HUD showing quest targets,
-extracts, airdrops and BTR trains **outside** the game window — heavily
-inspired by maschine's [QuestMarkers](https://sp-mod.com/mod/2954/quest-marker)
-(MIT; see License & credits). A BepInEx plugin streams live feed frames over a
-local WebSocket; a Python overlay renders them and a native Wayland
-layer-shell (or X11) presenter puts them on your desktop. Includes
-feed-freshness detection, scaling, imperial units, delayed-chord smoothing and
-a self-test suite.
+**Quest markers for SPT on Linux — drawn on your desktop, not lost in the game UI.**
 
-## How it works
+A transparent overlay that shows where your quest objectives, extracts, airdrops
+and BTRs are, with a pin, a distance and an arrow at the screen edge when the
+target is off-screen or behind you.
 
-> **The markers are not drawn inside the game window.** This mod is a bridge: the
-> plugin streams the live feed, and a separate **Python overlay window** draws it.
-> Pressing the toggle key alone changes nothing you can see unless the overlay
-> is running. Full loop while playing:
-> ```bash
-> # 1) start the overlay BEFORE/WHILE a raid (desktop side, Linux):
-> .venv/bin/python3 overlay.py --feed ws://127.0.0.1:9378
-> # 2) in-game: press I during the raid (or enable Show in raid automatically)
-> ```
+[![CI](https://github.com/Okamisan111/QuestMarkersLinux/actions/workflows/ci.yml/badge.svg)](https://github.com/Okamisan111/QuestMarkersLinux/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Linux%20%2B%20Wine%2FProton-informational)
 
-1. `plugin/` — BepInEx plugin (shows as **QuestMarkersLinux**, file
-   `chaossan-questmarkerslinux.dll`) runs in-game, scans quest/extract/airdrop/BTR targets and
-   streams normalized feed frames (v2: `nx/ny/behind` per marker) to the overlay.
-2. `overlay.py` — receives frames, renders maschine-style pin markers, tagboxes and
-   **edge arrows** (off-screen targets only ever appear as arrows at the screen border,
-   never in the middle), then streams dirty rects to the presenter.
-3. Presenter — Wayland layer-shell (default, real per-pixel alpha) or X11 window.
+</div>
 
-## Running
+---
 
-```bash
-python3 -m venv .venv
-.venv/bin/pip install pycairo websockets   # pycairo needs cairo dev headers + pkg-config
-bash wayland/build.sh          # native presenter (gcc, pkg-config, wayland-devel)
-.venv/bin/python3 overlay.py --test            # self-test suite
-.venv/bin/python3 overlay.py --feed ws://127.0.0.1:9378  # live with the game
-```
+## What this is
 
-Install into SPT: `dotnet build plugin/ -p:SptPath=/path/to/your/SPT` (or
-export `SPT_PATH` first), then copy
-`plugin/bin/Release/chaossan-questmarkerslinux.dll` into
-`<SPT>/BepInEx/plugins/`.
+SPT (Single Player Tarkov) runs on Linux through Wine or Proton. This project
+gives you the quest-marker HUD you know from mods on Windows:
 
-`feed_sim.py` generates synthetic raid traffic for developing without the game.
+- a **BepInEx plugin** inside the game reads your active quest targets,
+  extracts, airdrops and BTR positions;
+- a **small Python program** (`overlay.py`) draws them as pins with labels,
+  distances and edge arrows;
+- a **native presenter** puts that drawing on your desktop with real
+  transparency — Wayland layer-shell by default, X11 as a fallback.
 
-## In-game plugin config (`BepInEx/config/com.chaossan.questmarkerslinux.cfg`)
+It is a port inspired by **maschine's QuestMarkers** (MIT). Same look, same
+idea, rebuilt for Linux.
 
-Sections: **General**, **Display**, **Filter**, **Debug** — all English.
+### Read this first
 
-| Key | Default | Purpose |
+> **The plugin cannot draw anything by itself.**
+> The markers are *not* rendered inside the game window. The plugin only sends
+> data; `overlay.py` is what you actually see. If you press the toggle key and
+> nothing happens, the overlay is almost certainly not running — see
+> [Troubleshooting](#troubleshooting).
+
+### What it is not
+
+- Not a cheat for live Tarkov — SPT is offline, single-player only.
+- Not a wallhack: it shows quest markers (the same information the game gives
+  you), never player or bot positions.
+- Not affiliated with Battlestate Games or the SPT team.
+
+---
+
+## Requirements
+
+| You need | Why | Check with |
 |---|---|---|
-| `General / Enabled` | true | stream the feed |
-| `General / Toggle key` | **I** | press to show/hide markers during a raid |
-| `General / Toggle key shows` | Quests, Extracts, Airdrops, BTR | which kinds the toggle marks |
-| `General / Second key` | *(unbound)* | second hotkey with its own marker list |
-| `General / Second key shows` | Extracts | what the second key marks |
-| `General / Show in raid automatically` | true | show feed automatically at raid start |
-| `General / Feed Port`, `Feed Hz` | 9378, 60 | WebSocket feed endpoint (Hz 1-180, game-frame-aligned) |
-| `General / Feed Token` | empty (advanced) | shared feed secret — challenge/response + `"tok"` per frame; both sides must match (§ Feed Security) |
-| `Display / Show Labels`, `Show Distance` | true | label / distance text |
-| `Display / Edge Arrows` | true | off-screen targets as border arrows only |
-| `Display / Marker Scale` | 1.0 | original QuestMarkers size (0.5 = half) |
-| `Display / Far Distance`, `Far Scale` | 300 m, 0.6 | distant markers drawn smaller |
-| `Display / Imperial Units` | false | feet / miles instead of m / km |
-| `Display / Edge Arrow Size` | 24 px | arrow size at scale 1 |
-| `Display / Icon Scale` | 1.0 | symbol (pin + kind icon) size multiplier (0.2-5.0); advanced |
-| `Display / Auto-hide after` | 6 s | peek hides itself again |
-| `Filter / Maximum Distance`, `Maximum Quest Markers` | 0 (no cap), 16 | feed filter |
-| `Debug / Debug Log` | false | verbose feed/scan logging |
+| SPT installed and running under Wine/Proton | the plugin lives inside the game process | you can play SPT |
+| BepInEx 5 in your SPT folder | loads the plugin | `<SPT>/BepInEx/core/BepInEx.dll` exists |
+| Python 3.10+ | runs the overlay | `python3 --version` |
+| `pycairo` + `websockets` | drawing and the feed connection | installed in a venv below |
+| cairo dev headers + `pkg-config` | `pycairo` needs them to build | `pkg-config --modversion cairo` |
+| `gcc` + `wayland-client` dev | builds the native presenter | `pkg-config --modversion wayland-client` |
 
-### Advanced settings (Better BepInEx)
+`Better BepInEx` is **optional** and only affects the in-game settings menu (see
+[Advanced settings](#advanced-settings-better-bepinex)).
 
-With [Better BepInEx](https://sp-mod.com/mod/3207/better-bepinex) active,
-`Feed Port`, `Feed Token`, `Feed Hz`, `Second key*`, `Auto-hide after`, `Far Distance`,
-`Far Scale`, `Edge Arrow Size`, `Icon Scale` and `Debug Log` carry an
-`IsAdvanced` flag: they are hidden from the normal config list and only visible
-after the user enables Better BepInEx's advanced view. This tagging exists
-**only** in Better BepInEx — stock BepInEx has no in-game config UI at all;
-there all settings simply live in the plain `.cfg` file, nothing hidden or
-missing.
+---
 
-## Overlay config (`config.json`)
+## Quick start
 
-`config.json` is intentionally **not shipped** in this repository — it carries
-your personal feed token and monitor geometry. On a fresh clone:
+Five commands from a fresh clone. Copy-paste friendly.
 
 ```bash
-cp config.example.json config.json
-openssl rand -hex 16    # use the output as your feedToken
-```
+git clone https://github.com/Okamisan111/QuestMarkersLinux.git
+cd QuestMarkersLinux
 
-and set the same value in the plugin cfg (`General / Feed Token`, advanced
-section). Two different random values on the two sides simply means the
-overlay cannot connect — they are a shared secret, not individual settings.
-
-**Token changes are never hot.** The plugin captures `Feed Token`/`Feed Port`
-once at GAME start and uses that one snapshot for the challenge *and* the
-per-frame `tok` stamp; the overlay reads `config.json` once at OVERLAY start.
-An edit while either is running has no effect (the overlay logs
-`challenge response rejected -> token mismatch?` and redials). Worse, BepInEx
-rewrites the cfg from the in-memory config when the game exits — a mid-raid
-cfg edit can be silently undone on exit. Correct order: close the game → set
-both sides to the same value → start the game → start the overlay.
-
-Feature mirror of the plugin: `labels`, `distance`, `edge`, `scale`,
-`farDistance`, `farScale`, `imperial`, `edgeSize`, `iconScale`, `smooth`,
-`presenter`, `font`, `hz` (overlay **render** rate, default 120 — the plugin's
-**data** rate is `Feed Hz`, default 60; the chord smoother interpolates
-between feed samples at render rate).
-
-The font is chosen through fontconfig by name: if `Chakra Petch` is not
-installed cairo silently falls back to the system default. Install it (Arch:
-AUR `ttf-chakra-petch`; other distros / manual: fonts.google.com, SIL OFL 1.1)
-or set `"font": ""` to request the system font on purpose.
-
-The file is read from the directory of `overlay.py` regardless of the launch
-directory (`--config PATH` selects another one) — so `feedToken` applies no
-matter where the overlay is started from. A UTF-8 BOM is tolerated; a corrupt
-or unreadable file prints one warning line and the overlay continues with
-built-in defaults. Booleans are strict (`"labels": "no"` now really disables —
-before, any non-empty string counted as true), `hz` is clamped to 1..300 and
-`presenter` only ever accepts `wayland` or `x11`.
-
-`feedToken` (CLI override `--feed-token`) is the feed secret — see § Feed Security;
-it never leaves the machine: the overlay proves knowledge of it in the
-challenge/response and compares every frame's `tok` against it. A `ws://` feed
-with no token configured is refused unless `--insecure` is passed (dev only).
-
-`overlay.py --debug` prints per-frame feed stats (rect count, feed age, effective
-rate) every 2 s; `--readback` keeps the pixel-readback verification on.
-
-## Feed Security (loopback WS auth)
-
-The feed server binds to 127.0.0.1 only — but loopback means other local
-processes and **any web page opened in your browser** (WebSocket handshakes
-are not CORS-gated) could otherwise read the live game feed or evict the
-overlay from the server's single client slot. The handshake enforces:
-
-- requests carrying an `Origin` header (browsers always send one, RFC6455
-  §4.1) are **rejected**; native clients never send it.
-- a shared `Feed Token` (plugin cfg `General / Feed Token`, overlay
-  `config.json feedToken`) with **mutual challenge authentication (v3)**: the
-  token itself is never transmitted — not in a URL, not in a header, not per
-  frame. After the upgrade the server sends
-  `{"c":"chal","n":<nonce>,"p":HMAC-SHA256(key=token,msg=n)}`; the overlay
-  verifies `p` (a squatter on port 9378 cannot fake it, so no injected frame
-  is ever accepted), answers `{"c":"auth","r":<same HMAC>}` within 8 s, and
-  compares every frame's `tok` stamp constant-time. The plugin captures the
-  token once at game start and stamps frames from the same snapshot, so the
-  two sides cannot desync mid-raid. A `ws://` feed without a token is refused
-  unless `--insecure` is passed explicitly (development only).
-- the client slot is taken only after a successful challenge: silent
-  connections get an 8 s auth deadline and a 60 s idle timeout, every client
-  runs on its own thread, and only an AUTHENTICATED client may take over.
-- handshake headers are capped (8 KB per line, 64 KB total) with a 12 s
-  deadline against slow header drips.
-- incoming frames are hardened VIEWER-side too: one `sanitize_feed` pass at
-  the provider boundary guards the viewport (`v=[0,0]` used to raise
-  ZeroDivisionError and drop whole frames), caps marker count (128), label
-  length (160 chars, clipped labels end in a visible `…`) and every
-  coordinate/distance field before any rendering or smoothing; `frame_rects`
-  hard-caps the rect list at the presenter's MAXRECTS (2048) and splits
-  oversized merged clusters into row-aligned sub-rects at the surface size.
-  Feed-injected feature values are always
-  clamped (`iconScale` 0.25-4.0, `edgeSize` 4-192 px, scale 0.1-3.0,
-  presenter/font validated; unknown `cfg` keys are dropped). The plugin caps
-  its side too: labels are truncated at 120 chars (`…`), a frame is
-  byte-budgeted to fit the plugin's 8 KB wire buffer (UTF-8 exact,
-  distance-ordered, so the CLOSEST markers are the ones kept), and the
-  presenter derives its per-frame payload cap from the live surface size
-  (~33 MB at 4K, ~17 MiB at 1440p) and rejects `stride < 4*w` headers before
-  any memcpy.
-  `--trace` JSONL caps at 64 MiB, `logs/overlay.log` rotates at
-  startup (8 MiB -> `.1`, one generation), and the feed token never appears
-  in a log line. Batteries: tests/test_feed_auth.py,
-  tests/test_feed_hardening.py and tests/test_plugin_ws.py — the last one
-  compiles the production `plugin/src/WsServer.cs` unchanged (no game DLLs)
-  and tests the whole protocol from the server side.
-
-File-feed mode (`latest.json`, `feed_sim.py`) is a local dev tool and stays
-unauthenticated. Set your own token value if you share the machine. This is
-also why `config.json` is git-ignored: a committed token is a published
-token — the tracked `config.example.json` only carries a placeholder.
-
-## Running without a terminal (background mode)
-
-The plugin lives inside the Windows game process (Wine) and cannot spawn Linux
-programs — and it does not need to. The overlay is a single Python script;
-start it directly, no wrapper script involved:
-
-```bash
-cd /path/to/questmarkerslinux
-
-# one-time setup (local .venv, nothing system-wide, no root, no service)
+# 1) Python environment (local venv, nothing system-wide, no root)
 python3 -m venv .venv
-.venv/bin/pip install websockets pillow
+.venv/bin/pip install pycairo websockets
 
-# foreground run (Ctrl+C quits). SPT must be running; the overlay waits
-# for the feed and shows markers automatically when a raid starts.
-.venv/bin/python3 overlay.py
+# 2) build the native presenter
+bash wayland/build.sh
+
+# 3) your personal settings (feed token + monitor geometry)
+cp config.example.json config.json
+openssl rand -hex 16          # paste the output as "feedToken" in config.json
+
+# 4) sanity check: runs the built-in self-test, no game needed
+.venv/bin/python3 overlay.py --test
 ```
 
-Detached — no terminal open at all:
+**5) Install the plugin into SPT**
 
 ```bash
-mkdir -p logs
+dotnet build plugin/ -p:SptPath="/path/to/your/SPT"
+cp plugin/bin/Release/chaossan-questmarkerslinux.dll \
+   "/path/to/your/SPT/BepInEx/plugins/"
+```
+
+**6) Put the same token into the plugin.** Start SPT once so the config file
+appears, close the game, then edit
+`<SPT>/BepInEx/config/com.chaossan.questmarkerslinux.cfg`:
+
+```ini
+[General]
+Feed Token = <the same value you put in config.json>
+```
+
+Now start the game, start the overlay, and press **I** in a raid:
+
+```bash
+.venv/bin/python3 overlay.py --feed ws://127.0.0.1:9378
+```
+
+That's it. The overlay waits for the feed and shows markers on its own when a
+raid starts.
+
+---
+
+## The daily loop
+
+```bash
+# terminal 1 (or a launcher, or autostart — see below)
+cd /path/to/QuestMarkersLinux && .venv/bin/python3 overlay.py
+
+# then: launch SPT → enter a raid → press I
+```
+
+- **I** toggles the marker set you ticked in the plugin config.
+- The second key (unbound by default) has its own marker list.
+- Markers vanish automatically when the feed goes quiet (game closed, raid
+  over, plugin error) — a crashed game can never leave frozen pins on screen.
+
+### Start it without a terminal
+
+The plugin runs inside Wine and cannot start Linux programs. Start the overlay
+yourself — it is a single script, no service, no wrapper:
+
+```bash
 nohup .venv/bin/python3 overlay.py >> logs/overlay.log 2>&1 &
+
+pgrep -f overlay.py            # is it running?
+tail -f logs/overlay.log       # what is it doing?
+pkill -f "python3 overlay.py"  # stop it
 ```
 
-Check, watch, stop:
+Put that `nohup` line in your desktop autostart and you never see a terminal.
+
+---
+
+## Settings
+
+### Plugin config
+
+`<SPT>/BepInEx/config/com.chaossan.questmarkerslinux.cfg` — sections
+**General**, **Display**, **Filter**, **Debug**. Stock BepInEx has no in-game
+menu; edit the file (game closed, see [Token changes](#the-feed-token)).
+
+| Setting | Default | What it does |
+|---|---|---|
+| `General / Enabled` | on | stream the feed at all |
+| `General / Toggle key` | **I** | show/hide markers during a raid |
+| `General / Toggle key shows` | Quests, Extracts, Airdrops, BTR | what that key marks |
+| `General / Second key` | *(unbound)* | a second hotkey with its own list |
+| `General / Second key shows` | Extracts | what the second key marks |
+| `General / Show at raid start` | on | show the toggle key's markers automatically |
+| `General / Feed Port` | 9378 | loopback WebSocket port |
+| `General / Feed Token` | *(empty)* | shared secret, see [security](#the-feed-token) |
+| `General / Feed Hz` | 60 | frames per second sent by the plugin (1–180) |
+| `Filter / Maximum Distance` | 0 (no cap) | hide everything farther than this |
+| `Filter / Maximum Quest Markers` | 16 | closest objectives win |
+| `Display / Show Labels` | on | marker name next to the pin |
+| `Display / Show Distances` | on | e.g. `885m` / `1.1km` |
+| `Display / Edge Arrows` | on | off-screen targets as border arrows only |
+| `Display / Auto-hide after` | 6 s | peek markers hide themselves again |
+| `Display / Marker Size` | 1.0 | 0.5 = half size |
+| `Display / Far Distance` / `Far Scale` | 300 m / 0.6 | distant markers shrink |
+| `Display / Imperial Units` | off | feet and miles |
+| `Display / Edge Arrow Size` | 24 px | arrow size at scale 1.0 |
+| `Display / Icon Scale` | 1.0 | symbol size multiplier |
+| `Debug / Debug Log` | off | verbose scan/feed logging |
+
+#### Advanced settings (Better BepInEx)
+
+With [Better BepInEx](https://sp-mod.com/mod/3207/better-bepinex) the following
+are tagged **advanced** and hidden behind its advanced view: `Feed Port`,
+`Feed Hz`, `Edge Arrow Size`, `Debug Log`. The `Feed Token` is deliberately a
+normal setting — you need it on first setup.
+
+This tagging only exists in Better BepInEx. Stock BepInEx just shows you the
+plain `.cfg`, where nothing is hidden.
+
+### Overlay config
+
+`config.json` next to `overlay.py` (or `--config PATH`). It is **not** in the
+repository on purpose — it carries your feed token.
+
+```json
+{
+  "feed": "ws://127.0.0.1:9378",
+  "hz": 120,
+  "smooth": 0.045,
+  "presenter": "wayland",
+  "labels": true,
+  "distance": true,
+  "edge": true,
+  "scale": 1.0,
+  "farDistance": 300.0,
+  "farScale": 0.6,
+  "imperial": false,
+  "edgeSize": 24,
+  "iconScale": 1.0,
+  "feedToken": "your-own-random-value"
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `feed` | `ws://127.0.0.1:9378` | feed source: `ws://…` or a `latest.json` path |
+| `hz` | 120 | **render** rate; the plugin's data rate is `Feed Hz` |
+| `smooth` | 0.045 s | seam blending of the motion interpolator (0 = raw) |
+| `presenter` | `wayland` | `wayland` (layer-shell, real alpha) or `x11` |
+| `labels`, `distance`, `edge` | true | mirrors the plugin display options |
+| `scale`, `farDistance`, `farScale`, `iconScale` | 1.0 / 300 / 0.6 / 1.0 | sizes |
+| `edgeSize` | 24 | edge arrow size in px |
+| `imperial` | false | feet/miles |
+| `readback` | false | keep the pixel-readback verification |
+| `display`, `geometry` | null | force a monitor / geometry |
+| `feedToken` | — | shared secret, must equal the plugin's `Feed Token` |
+
+The file is read once at overlay start. A UTF-8 BOM is fine; a broken file
+prints one warning and the overlay continues with defaults. Booleans are
+strict (`"labels": "no"` really means off), unknown keys are ignored, `hz` is
+clamped to 1–300, and `presenter` only accepts `wayland` or `x11`.
+
+**Font:** labels use *Chakra Petch* if fontconfig finds it, otherwise your
+system font. Install it (Arch: AUR `ttf-chakra-petch`; elsewhere:
+fonts.google.com, SIL OFL 1.1) or set `"font": ""` to use the system font on
+purpose.
+
+### Command line
+
+| Flag | Purpose |
+|---|---|
+| `--feed URL_OR_FILE` | feed source |
+| `--config PATH` | alternate config file |
+| `--hz N` | render rate |
+| `--smooth S` | seam blending |
+| `--presenter wayland\|x11` | force a presenter |
+| `--display NAME`, `--geometry WxH+X+Y` | pick screen / placement |
+| `--test` | self-test suite, no game needed |
+| `--debug` | per-frame feed stats every 2 s |
+| `--trace FILE.jsonl` | log every incoming frame (capped at 64 MiB) |
+| `--readback` | verify what actually reached the screen |
+| `--keep`, `--seconds N`, `--argb/--no-argb` | dev/debug helpers |
+| `--feed-token T` | token override (prefer `config.json`) |
+| `--insecure` | allow a `ws://` feed with no token (dev only) |
+
+---
+
+## The feed token
+
+The feed server listens on `127.0.0.1` only — but "loopback only" is not
+"private". Without protection, any local process — and *any web page you open
+in a browser*, because WebSocket handshakes are not blocked by CORS — could
+read your live quest positions or kick the overlay out of the server's single
+client slot.
+
+So the feed has a shared secret, and both sides must hold it:
+
+1. **The token is never transmitted.** Not in the URL, not in a header, not in
+   a frame. Instead the server proves it knows the token, then the overlay
+   proves it back — two different HMAC-SHA256 values over a fresh random nonce.
+2. **Echoing is not enough.** The client's answer is derived differently from
+   the server's proof, so a process that simply replays what it received is
+   refused.
+3. **Every frame is stamped** with an HMAC over that frame's own timestamp,
+   checked in constant time. A frame cannot be replayed under another
+   timestamp, and reading the feed never reveals the token.
+4. **Browsers are shut out** regardless: handshakes carrying an `Origin`
+   header get `403` before any upgrade.
+5. **Only an authenticated client gets the slot.** An unauthenticated
+   connection waits 8 s and is dropped; it can never evict your overlay.
+
+If you leave `Feed Token` empty, the feed is unauthenticated (any local
+process can read it) — the plugin logs a warning at startup. The overlay
+refuses a `ws://` feed without a token unless you pass `--insecure`.
+
+### Token changes
+
+A token change is never hot, and the order matters:
+
+```
+close the game  →  edit both sides to the same value  →  start the game  →  start the overlay
+```
+
+The plugin reads its config at **game** start, the overlay reads
+`config.json` at **overlay** start. BepInEx also rewrites its `.cfg` on exit,
+so an edit made while the game is running can be silently undone. Wrong order
+= redial loop with a clear message in the log, never silent wrong data.
+
+Keep `config.json` out of git — that is why it is ignored and only the
+placeholder `config.example.json` is tracked.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Nothing appears, ever | overlay not running | start `overlay.py`, check `pgrep -f overlay.py` |
+| Keys do nothing | you pressed **I** without an overlay | the key only toggles what the overlay draws |
+| `ws feed: ... (retry in 2 s)` forever | token mismatch or old plugin | same token on both sides, restart **game first**, then overlay |
+| `server could NOT prove knowledge of the feed token` | something else owns port 9378, or the token differs | close the squatter / align the tokens |
+| `refusing an unauthenticated ws:// feed` | no token, no `--insecure` | set a token (recommended) or pass `--insecure` for dev |
+| Markers misplaced after a resolution change | surface size changed | handled live via `presenter: configured WxH`; on a **rotated** screen markers are clipped by design (one honest warning is printed) |
+| `presenter keeps dying - giving up` | compositor refused the surface (often XWayland or an unsupported protocol) | try `--presenter x11`, check the log line before the deaths |
+| Labels in a boring font | Chakra Petch not installed | install it or set `"font": ""` |
+| Markers freeze on screen | feed went quiet > 1 s | expected: the overlay clears itself; check the game/plugin log |
+| Feed works, markers jitter | very low game FPS | the smoother interpolates real measurements; lower `hz` rarely helps, see [Under the hood](#under-the-hood) |
+
+Still stuck? `--debug` gives per-frame stats, `--trace out.jsonl` gives every
+raw frame — that is enough to tell a feed problem from a drawing problem.
+
+---
+
+## Under the hood
+
+Three parts, one direction of data flow:
+
+```
+SPT + BepInEx plugin  ──ws://127.0.0.1:9378──▶  overlay.py  ──shared memory──▶  presenter
+   (Wine process)                                (Linux)                        (Wayland/X11)
+```
+
+**The plugin** (`plugin/src/`) scans quest targets, extract points, airdrops and
+BTR trains, projects them to normalized screen coordinates (`nx`, `ny`, plus a
+`behind` flag), and pushes one JSON frame per `Feed Hz` tick. The frame head is
+built first and each marker is measured in real UTF-8 bytes before it enters
+the array, so a frame always fits the 8 KiB send buffer — and because markers
+are distance-sorted, the ones that get dropped when a frame is full are the
+*far* ones.
+
+**The overlay** (`overlay.py`) sanitizes the frame at the provider boundary
+(viewport, marker count 128, label length 160, every coordinate and feature
+clamped), interpolates motion, composites overlapping markers in Python, and
+sends dirty rects to the presenter. Feed frames older than **1 second** clear
+the display.
+
+**The presenter** (`wayland/wayland_present.c`) is a tiny C program: a
+layer-shell surface with per-pixel alpha on Wayland, a shaped window on X11. It
+copies rects with `memcpy`, bounds each rect to one full surface and a full
+frame to 2× that, and exits fail-closed on a desynced header instead of
+guessing. If it dies, the overlay respawns it (5 tries per death, at most 50
+deaths per run).
+
+### Motion: why not a plain smoothing filter
+
+Feed positions arrive at the game's frame cadence, which is a staircase. A
+classic exponential smoother re-accelerates toward every step and micro-stops
+before the next one — visible jitter that gets worse as a marker gets close.
+So the overlay uses a **delayed chord interpolator**: it always draws a point
+on the chord between the last two *real* measurements, evaluated at render
+time.
+
+- display trails the newest measurement by one interval (~33 ms at 30 Hz) —
+  constant, invisible;
+- velocity is constant between measurements, so no pulsing (measured on real
+  Shoreline data: display-velocity pulses up to 3.5× true speed at 26–56 m
+  before, median 0.14–0.20 of true speed after);
+- close-range parallax lag drops from ~34 px to ~11 px at 4 m;
+- no extrapolation: a standing marker is rock-steady, reversals overshoot ≤ 3 px,
+  and a feed gap > 300 ms snaps instead of crawling.
+
+Seam blending (`smooth`, default 0.045 s, overlay side only) softens direction
+changes at chord boundaries and is capped so it never trails more than ~6 px
+at speed. `tests/test_smooth.py` contains the staircase test that proves the
+old stutter and the fix.
+
+### Things that are deliberately not drawn
+
+Markers behind the player are never mirrored onto the screen. They become an
+edge arrow at the nearest border side, or nothing if `Edge Arrows` is off, and
+re-enter the view at their real position when you turn around.
+
+### Distances
+
+Metric: `885m`, `1.1km`. Imperial: `4921ft` below 1609 m, `1.2mi` from there
+(1 mi = 5280 ft).
+
+---
+
+## Testing
+
+Everything is a plain script with a `RESULT:` line — no pytest, no fixtures:
 
 ```bash
-pgrep -f overlay.py            # status (empty = not running)
-tail -f logs/overlay.log       # live log
-pkill -f "python3 overlay.py"  # stop
+.venv/bin/python3 tests/test_feed_auth.py        # overlay side of the handshake
+.venv/bin/python3 tests/test_plugin_ws.py        # the REAL C# server (needs dotnet)
+.venv/bin/python3 tests/test_feed_hardening.py   # sanitizer, caps, log masking
+.venv/bin/python3 tests/test_frame_rects.py      # geometry
+.venv/bin/python3 tests/test_smooth.py           # interpolation
+.venv/bin/python3 overlay.py --test              # built-in self-test
 ```
 
+`tests/test_plugin_ws.py` is the interesting one: it compiles the production
+`plugin/src/WsServer.cs` unchanged into a small console harness
+(`tests/plugin/`), because the real plugin references BepInEx and UnityEngine
+DLLs that cannot be shipped or built in CI. The wire protocol is therefore
+tested for real, including the negative cases: wrong answer, echoed answer,
+silent client, browser `Origin`, oversized headers, takeover.
 
-Then just launch SPT, press **I** in a raid - markers appear without ever
-touching a terminal.
+CI runs all of it on every push (`.github/workflows/ci.yml`), plus the
+presenter build with a checksum artifact.
 
-## Notes
+---
 
-- Feed frames older than **1 second** trigger an automatic overlay clear —
-  a crashed game can never leave frozen markers on your screen.
-- The feed WebSocket answers client pings (RFC6455 pong). Before this the
-  python `websockets` keepalive killed the connection every ~20-60 s mid-raid
-  ("keepalive ping timeout") and the overlay showed a 2 s marker gap per event.
-- Smoothing is a delayed-chord interpolator, not an EMA: the overlay always
-  displays the position on the chord between the last two REAL feed
-  measurements, evaluated at render time, so the display trails the newest
-  measurement by one measurement interval (~33 ms at 30 Hz - constant and
-  invisible) while moving with perfectly constant velocity at display rate.
-  Why: the game feeds positions at game-FPS cadence, which is a staircase;
-  an EMA re-accelerates toward every stair step and micro-stops before the
-  next one - visible zappeln for slow/closing markers (measured on real
-  Shoreline data: display-velocity pulses up to 3.5x true speed at 26-56 m).
-  The chord model removes those pulses (median 0.23-0.81 -> 0.14-0.20 of
-  true speed) and close-range parallax lag (34 px -> 11 px at 4 m). Seam
-  blending (tunable overlay-side only, config.json `smooth` or `--smooth`,
-  default 0.045 s - deliberately not an in-game option) softens velocity
-  changes at chord boundaries: higher = softer direction changes, 0 = raw
-  interpolation; at speed the blend is capped so it never trails more than
-  ~6 px.
-- Markers behind the player never appear as mirrored markers on screen:
-  they become edge arrows (arrow at the nearest border side) or, with
-  `Edge Arrows` disabled, draw nothing at all. Markers re-entering the view
-  start fresh at their real position - no cross-screen interpolation from
-  behind-camera projections. The display is always on a real chord: no extrapolation, a
-  stationary marker is rock-steady, reversals overshoot <= ~3 px, and feed
-  gaps > 300 ms snap instead of crawling. Battery: tests/test_smooth.py
-  (includes a staircase test that proves the old EMA stutter and the fix).
-- Overlapping markers are composited in Python (`merge_overlapping`): the
-  presenter memcpy-copies dirty rects without blending, so before this,
-  semi-transparent tagbox footprints of overlapping markers occluded each
-  other as rectangular patches. Clustered rects are pixel-disjoint now.
-- Display changes are followed live: the presenter reports its surface size
-  on every KWin mode/scale change (`presenter: configured WxH` in the log)
-  and the normalized feed coordinates are remapped onto the real surface —
-  markers stay correctly placed under fractional scaling (e.g. 150 %,
-  2560x1440 feed on a 1707x960 surface) instead of breaking after the first
-  frame. A ROTATED display stays best-effort: an aspect guard prints one
-  honest warning and markers are clipped to the surface rather than skewed.
-  The x11 presenter probes depth-32 capability (XWayland advertises the
-  visual but refuses the window) and falls back to the ShapeClip path with a
-  clear message; a protocol-v2 feed is auto-converted for it, which fixes
-  the old `KeyError: 'x'` crash on the first frame. A died presenter
-  respawns (5 tries per death, at most 50 deaths per run before the overlay
-  gives up with an explicit log line).
-- `t` fields in feed JSON are epoch **milliseconds**.
-- Distances format like the original: `885m` / `1.1km` (metric) or `4921ft`
-  below 1609 m and `1.2mi` from there (imperial; 1 mi = 5280 ft).
+## Project layout
+
+```
+overlay.py                  the overlay: feed client, renderer, presenter driver
+feed_sim.py                 synthetic raid feed for developing without the game
+config.example.json         template for your own config.json (not committed)
+plugin/
+  src/Plugin.cs             BepInEx entry point, scanning, frame building
+  src/WsServer.cs           minimal RFC6455 server + v4 feed authentication
+  src/BridgeScanner.cs      target discovery
+  bin/Release/*.dll         prebuilt plugin (built from src/, see Quick start)
+wayland/
+  wayland_present.c         native presenter (Wayland layer-shell)
+  build.sh                  builds it, vendored protocol XML
+tests/                      the test batteries above
+tools/                      trace replay/report helpers
+```
+
+---
+
+## FAQ
+
+**Do I need to run the overlay every time?**
+Yes. One script, autostart it once and forget it.
+
+**Can the plugin start the overlay itself?**
+No — the plugin lives inside the Wine process and cannot launch Linux programs.
+
+**Does this work on X11?**
+Yes, `--presenter x11`. Wayland layer-shell is the default and has true
+per-pixel alpha.
+
+**SPT just updated — will the mod break?**
+A game update can change the classes the plugin reads. Rebuild the plugin
+against the new install (`dotnet build plugin/ -p:SptPath=…`) and re-copy the
+DLL; the overlay is independent of the game version.
+
+**Are my positions sent anywhere?**
+No. Everything is on your machine, over loopback, and the token is never
+transmitted.
+
+---
 
 ## License & credits
 
-MIT (see `LICENSE`). The marker design, icon set and visual language are
-adapted from **maschine's QuestMarkers** (MIT,
-<https://sp-mod.com/mod/2954/quest-marker>) — thank you, maschine, for the
-mod and for blessing this port. Text rendering uses the system font
-**Chakra Petch** (SIL Open Font License 1.1, fonts.google.com); this
-repository does not ship the font itself.
+MIT — see [`LICENSE`](LICENSE).
 
-This is an unofficial community port for Linux/Proton (SPT) play. It is not
-affiliated with or endorsed by Battlestate Games.
+The marker design, icon set and visual language are adapted from
+**maschine's QuestMarkers** (MIT, <https://sp-mod.com/mod/2954/quest-marker>).
+Thank you, maschine, for the mod and for blessing this port.
+
+Labels use the system font **Chakra Petch** (SIL Open Font License 1.1); the
+font itself is not shipped here. Rendering uses cairo.
+
+Unofficial community port for Linux/Proton play, not affiliated with or
+endorsed by Battlestate Games.

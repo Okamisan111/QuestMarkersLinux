@@ -78,7 +78,7 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
         port = Config.Bind("General", "Feed Port", 9378,
             Tagged("Feed Port", 5, "WebSocket port the quest-overlay presenter connects to (loopback only). Only for non-standard setups.", null, true));
         feedToken = Config.Bind("General", "Feed Token", "",
-            Tagged("Feed Token", 3, "Shared secret for the overlay feed. It is NEVER sent over the network: the server first proves itself to the overlay (challenge HMAC over a fresh nonce), then the overlay proves itself back within 8 s; wrong or missing answers are rejected without ever opening the client slot. Frames additionally carry a token stamp the overlay verifies (frame-level integrity). Empty = unauthenticated feed (any local process can read live raid positions; browser-Origin handshakes stay rejected either way). Changing the token only takes effect with the game closed: the plugin reads it at game start, the overlay reads its config.json at overlay start - set both sides to the same value, then start the game first, then the overlay.", null, true));
+            Tagged("Feed Token", 3, "Shared secret for the overlay feed. It is NEVER sent over the network: the server first proves itself to the overlay (challenge HMAC over a fresh nonce), then the overlay proves itself back with a separately derived answer within 8 s; wrong, missing or merely echoed answers are rejected without ever opening the client slot. Frames additionally carry an HMAC stamp over their own timestamp - never the token - which the overlay verifies at frame level. Empty = unauthenticated feed (any local process can read live raid positions; browser-Origin handshakes stay rejected either way). Changing the token only takes effect with the game closed: the plugin reads it at game start, the overlay reads its config.json at overlay start - set both sides to the same value, then start the game first, then the overlay.", null));
         feedHz = Config.Bind("General", "Feed Hz", 60f,
             Tagged("Feed Hz", 4, "Frames per second pushed to the overlay (1-180, game-frame-aligned sampling). Higher is smoother near quest targets - their screen speed scales with 1/distance; values above your game FPS add nothing.", null, true));
         maxDistance = Config.Bind("Filter", "Maximum Distance", 0f,
@@ -279,6 +279,38 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
         int h = Screen.height;
         StringBuilder mJson = new StringBuilder(2048);
         StringBuilder mFrag = new StringBuilder(160);
+        // The frame HEAD is written UNCONDITIONALLY. Idle frames (targets ==
+        // null, i.e. markers hidden by the toggle key or the auto-hide timer)
+        // must still be complete JSON: while the head was built inside the
+        // projection block an idle frame was `,"m":[]}` - not parseable - so
+        // the overlay dropped it and the last markers stayed frozen on screen
+        // for the whole 1 s staleness window before the display cleared.
+        long tMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        sb.Append("{\"t\":").Append(tMs);
+        sb.Append(",\"v\":[").Append(w).Append(',').Append(h).Append(']');
+        sb.Append(",\"cfg\":{\"labels\":").Append(showLabels.Value ? "true" : "false");
+        sb.Append(",\"distance\":").Append(showDistance.Value ? "true" : "false");
+        sb.Append(",\"edge\":").Append(edgeArrows.Value ? "true" : "false");
+        sb.Append(",\"scale\":").Append(markerScale.Value.ToString("F2", CultureInfo.InvariantCulture));
+        sb.Append(",\"farDistance\":").Append(farDistance.Value.ToString("F1", CultureInfo.InvariantCulture));
+        sb.Append(",\"farScale\":").Append(farScale.Value.ToString("F2", CultureInfo.InvariantCulture));
+        sb.Append(",\"imperial\":").Append(imperialUnits.Value ? "true" : "false");
+        sb.Append(",\"edgeSize\":").Append(edgeArrowSize.Value);
+        sb.Append(",\"iconScale\":").Append(iconScale.Value.ToString("F2", CultureInfo.InvariantCulture));
+        sb.Append('}');
+        sb.Append(",\"tok\":");
+        // The stamp is a MAC over THIS frame's timestamp, never the token
+        // itself: anyone reading the feed cannot recover the shared secret,
+        // and a captured stamp does not verify for another frame. Empty
+        // Feed Token keeps the legacy empty stamp (overlay checks nothing).
+        AppendJsonString(sb, activeFeedToken.Length == 0
+            ? ""
+            : HmacHex(activeFeedToken, tMs.ToString(CultureInfo.InvariantCulture)));
+        // Real-byte budget: WsServer.sendBuf is 8192 and the WS header is
+        // 4 bytes for payloads < 65536; head+tok (measured here) plus the
+        // closing ,"m":[ .. ]} (8 bytes) plus header (4) must stay <= 8192.
+        int wireBytes = Encoding.UTF8.GetByteCount(sb.ToString()) + 12;
+        int wireBudget = 8192 - 4;
         if (camera != null && targets != null)
         {
             Vector3 camPos = camera.transform.position;
@@ -319,30 +351,6 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
             }
             visible.Sort((a, b) => a.dist.CompareTo(b.dist));
             int questCount = 0;
-            // The frame head is built FIRST so the wire budget is measured,
-            // not estimated: every byte the overlay really receives is counted
-            // before a single marker enters the array.
-            sb.Append("{\"t\":").Append(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-            sb.Append(",\"v\":[").Append(w).Append(',').Append(h).Append(']');
-            sb.Append(",\"cfg\":{\"labels\":").Append(showLabels.Value ? "true" : "false");
-            sb.Append(",\"distance\":").Append(showDistance.Value ? "true" : "false");
-            sb.Append(",\"edge\":").Append(edgeArrows.Value ? "true" : "false");
-            sb.Append(",\"scale\":").Append(markerScale.Value.ToString("F2", CultureInfo.InvariantCulture));
-            sb.Append(",\"farDistance\":").Append(farDistance.Value.ToString("F1", CultureInfo.InvariantCulture));
-            sb.Append(",\"farScale\":").Append(farScale.Value.ToString("F2", CultureInfo.InvariantCulture));
-            sb.Append(",\"imperial\":").Append(imperialUnits.Value ? "true" : "false");
-            sb.Append(",\"edgeSize\":").Append(edgeArrowSize.Value);
-            sb.Append(",\"iconScale\":").Append(iconScale.Value.ToString("F2", CultureInfo.InvariantCulture));
-            sb.Append('}');
-            sb.Append(",\"tok\":");
-            // Single source: the stamped tok is the exact startup snapshot the
-            // WS server authenticated the overlay against.
-            AppendJsonString(sb, activeFeedToken);
-            // Real-byte budget: WsServer.sendBuf is 8192 and the WS header is
-            // 4 bytes for payloads < 65536; head+tok (measured here) plus the
-            // closing ,"m":[ .. ]} (8 bytes) plus header (4) must stay <= 8192.
-            int wireBytes = Encoding.UTF8.GetByteCount(sb.ToString()) + 12;
-            int wireBudget = 8192 - 4;
             for (int i = 0; i < visible.Count; i++)
             {
                 MarkerTarget t = visible[i].t;
@@ -451,6 +459,20 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
             }
         }
         sb.Append('"');
+    }
+
+    /// HMAC-SHA256(key, message) as lowercase hex - used for the per-frame tok
+    /// stamp so the shared token itself never leaves this process.
+    private static string HmacHex(string key, string message)
+    {
+        using (var hmac = new System.Security.Cryptography.HMACSHA256(
+                   Encoding.UTF8.GetBytes(key)))
+        {
+            byte[] mac = hmac.ComputeHash(Encoding.UTF8.GetBytes(message));
+            var sb = new StringBuilder(mac.Length * 2);
+            foreach (byte b in mac) sb.Append(b.ToString("x2", CultureInfo.InvariantCulture));
+            return sb.ToString();
+        }
     }
 }
 

@@ -12,16 +12,19 @@ namespace QuestMarkersLinux;
 /// Minimal RFC6455 WebSocket server for the native overlay feed.
 /// Text frames only; one client slot.
 ///
-/// Feed authentication (protocol v3): the shared token is NEVER sent - not in
-/// the URL, not in a header, not per frame in the clear. After the 101 upgrade
-/// the server sends a challenge text frame
-///   {"c":"chal","n":"<server nonce hex>","p":"<HMAC-SHA256(key=token, msg=n) hex>"}
+/// Feed authentication (protocol v4): the shared token is NEVER sent - not in
+/// the URL, not in a header, not in any frame. After the 101 upgrade the
+/// server sends a challenge text frame
+///   {"c":"chal","n":"<server nonce hex>",
+///    "p":"<HMAC-SHA256(key=token, msg="server|"+n) hex>"}
 /// The overlay verifies p with the shared token (proving the SERVER - a local
 /// process squatting the port cannot forge it) and answers within 8 s with
-///   {"c":"auth","r":"<HMAC-SHA256(key=token, msg=n) hex>"}
-/// (proving the CLIENT). Both compares are constant time. Only an
-/// authenticated client ever occupies the client slot - takeover by a new
-/// connection happens strictly after its challenge succeeds, and a client
+///   {"c":"auth","r":"<HMAC-SHA256(key=token, msg="client|"+n) hex>"}
+/// (proving the CLIENT). The two proofs are domain-separated: a peer that only
+/// echoes the server's own p back is rejected, so the answer can only verify
+/// for a peer that really holds the token. Both compares are constant time.
+/// Only an authenticated client ever occupies the client slot - takeover by a
+/// new connection happens strictly after its challenge succeeds, and a client
 /// that merely connects without replying holds nothing (8 s auth deadline,
 /// 60 s idle timeout afterwards; every client runs on its own thread so the
 /// accept loop is never stalled). An empty Feed Token disables the challenge
@@ -175,12 +178,15 @@ internal sealed class WsServer : IDisposable
             byte[] nonceBuf = new byte[16];
             using (RandomNumberGenerator rng = RandomNumberGenerator.Create()) rng.GetBytes(nonceBuf);
             string nonce = Hex(nonceBuf);
-            string proof = HmacHex(token, nonce);
+            string proof = HmacHex(token, "server|" + nonce);
             SendText(stream, "{\"c\":\"chal\",\"n\":\"" + nonce + "\",\"p\":\"" + proof + "\"}");
             stream.ReadTimeout = 8000; // the overlay answers in milliseconds
             string reply = ReadClientTextFrame(stream, 4096);
             string answer = ExtractJsonField(reply, "r");
-            if (answer == null || !ConstantTimeEquals(answer, proof))
+            // Domain-separated client proof: an echo of the server's own p must
+            // NOT be accepted (that would authenticate anyone who can connect).
+            string expected = HmacHex(token, "client|" + nonce);
+            if (answer == null || !ConstantTimeEquals(answer, expected))
             {
                 log("Feed client refused: challenge response missing or wrong - " +
                     "is the overlay's config.json feedToken the same value as the " +
@@ -430,7 +436,11 @@ internal sealed class WsServer : IDisposable
 
     private static bool ConstantTimeEquals(string a, string b)
     {
-        if (a == null || b == null || a.Length != b.Length) return false;
+        if (a == null || b == null) return false;
+        // net48 has no CryptographicOperations.FixedTimeEquals. Both inputs are
+        // fixed-width hex digests, so the LENGTH is not a secret; the content
+        // compare below runs over every character without an early exit.
+        if (a.Length != b.Length) return false;
         int diff = 0;
         for (int i = 0; i < a.Length; i++) diff |= (ushort)a[i] ^ (ushort)b[i];
         return diff == 0;

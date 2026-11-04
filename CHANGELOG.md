@@ -3,19 +3,25 @@
 ## v1.1.0 — 2026-11-04
 
 Protocol **breaking** release: the overlay feed now uses mutual challenge
-authentication (feed protocol v3). Plugin 1.1.x and overlay 1.1.x must be
+authentication (feed protocol v4). Plugin 1.1.x and overlay 1.1.x must be
 used together; a 1.0.x overlay cannot authenticate against a 1.1 plugin and
 vice versa (it redials instead of accepting frames).
 
-### Feed security (v3 challenge/response)
-- The token is never transmitted anymore: not in the connect URL, not in a
-  header, not per frame. After the WebSocket upgrade the server sends
-  `{"c":"chal","n":<nonce>,"p":HMAC-SHA256(key=token, msg=n)}`; the overlay
-  VERIFIES `p` (only the real plugin can produce it - a process squatting
-  port 9378 is cut off before it injects a single frame) and answers
-  `{"c":"auth","r":<same HMAC>}` within 8 s. Both compares are constant-time.
-- Frames still carry a `tok` stamp; the overlay compares it with
-  `hmac.compare_digest` (frame-level integrity).
+### Feed security (v4 mutual challenge/response)
+- The shared token is never transmitted: not in the connect URL, not in a
+  header, not in any frame. After the WebSocket upgrade the server sends
+  `{"c":"chal","n":<nonce>,"p":HMAC-SHA256(key=token, msg="server|"+n)}`; the
+  overlay VERIFIES `p` (only the real plugin can produce it - a process
+  squatting port 9378 is cut off before it injects a single frame) and answers
+  `{"c":"auth","r":HMAC-SHA256(key=token, msg="client|"+n)}` within 8 s. The
+  two proofs are domain-separated, so echoing the server's own `p` back does
+  NOT authenticate - admission requires really holding the token. Both
+  compares are constant-time.
+- The per-frame `tok` stamp is `HMAC-SHA256(key=token, msg=<frame "t">)`,
+  never the token itself: reading the feed cannot recover the secret, and a
+  captured stamp does not verify for a different frame. The overlay compares
+  it with `hmac.compare_digest` and drops frames whose stamp is missing or
+  wrong (fail closed).
 - A ws:// feed WITHOUT a token is now refused by the overlay unless
   `--insecure` is given explicitly (dev/test against a plugin with an empty
   Feed Token).
@@ -24,6 +30,15 @@ vice versa (it redials instead of accepting frames).
   from that one snapshot - a live-edited cfg can no longer desync the two
   sides. A token change still requires: game closed -> edit both sides ->
   start game -> start overlay.
+
+### Fixed
+- Markers no longer freeze for ~1 s when they disappear. While idle (toggle
+  key off, or right after the auto-hide timer fires) the plugin omitted the
+  frame head and sent `,"m":[]}` - invalid JSON. The overlay discarded those
+  frames silently, the feed timestamp stopped advancing, and the last drawn
+  image stayed on screen until the 1 s staleness rule cleared it. The frame
+  head is now written unconditionally, and the overlay reports malformed
+  frames once per connection instead of swallowing them.
 
 ### Server hardening (WsServer.cs)
 - Every client runs on its own thread; a silent connection can no longer

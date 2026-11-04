@@ -19,3 +19,7 @@ plugin/obj/
 .ref/
 QA_REPORT*.md
 plugin/Directory.Build.props
+
+# dotnet harness build output
+tests/plugin/bin/
+tests/plugin/obj/

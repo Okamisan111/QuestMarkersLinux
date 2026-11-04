@@ -2305,15 +2305,18 @@ def make_feed_provider(path, trace_path=None, feed_token=""):
     trace_path: log EVERY arriving raw frame (arrival wall time + feed time
     + all markers) as JSON lines - the ground-truth tap for diagnosing feed
     jitter (presence gaps, alternating projections, send cadence).
-    feed_token (ws:// only, protocol v3): the server first sends
-    {"c":"chal","n":<nonce>,"p":<HMAC-SHA256(key=token,msg=n)>}; the overlay
-    VERIFIES p (proves the real plugin - a process squatting the port cannot
-    forge it) and answers {"c":"auth","r":<same HMAC>} (proves it knows the
-    token). The token itself is never sent. Frames additionally carry a "tok"
-    stamp compared in constant time; mismatches drop the frame. Without a
-    token there is no challenge and any local process dictating the port also
-    dictates the display (--insecure is the only way there). File feeds (dev
-    tools) are local-only and not authenticated.
+    feed_token (ws:// only, protocol v4): the server first sends
+    {"c":"chal","n":<nonce>,"p":<HMAC-SHA256(key=token,msg="server|"+n)>}; the
+    overlay VERIFIES p (proves the real plugin - a process squatting the port
+    cannot forge it) and answers {"c":"auth","r":<HMAC over "client|"+n>}, a
+    separately derived value (proves it knows the token; echoing the server's
+    own p back does not authenticate). The token itself is never sent. Every
+    frame additionally carries a "tok" stamp = HMAC-SHA256(token, its "t"
+    timestamp), compared in constant time; a missing or mismatching stamp
+    drops the frame, so a frame cannot be replayed under another timestamp.
+    Without a token there is no challenge and any local process dictating the
+    port also dictates the display (--insecure is the only way there). File
+    feeds (dev tools) are local-only and not authenticated.
     Token changes: the plugin reads its cfg at GAME start, the overlay reads
     config.json at OVERLAY start - change a token with the game closed, then
     start the game first, then the overlay (never the other way around).
@@ -2386,7 +2389,7 @@ def make_feed_provider(path, trace_path=None, feed_token=""):
                                     "QuestMarkersLinux 1.1+ plugin feed (or a process "
                                     "that cannot prove the feed token)")
                             expect = hmac.new(feed_token.encode("utf-8"),
-                                              chal["n"].encode("utf-8"),
+                                              ("server|" + chal["n"]).encode("utf-8"),
                                               hashlib.sha256).hexdigest()
                             if not hmac.compare_digest(expect, chal["p"]):
                                 raise RuntimeError(
@@ -2394,7 +2397,12 @@ def make_feed_provider(path, trace_path=None, feed_token=""):
                                     "token - refusing the feed (plugin Feed Token vs. "
                                     "config.json feedToken: same value? game was "
                                     "restarted after the token change?)")
-                            await ws.send(json.dumps({"c": "auth", "r": expect},
+                            # Domain-separated answer: echoing chal["p"] back would
+                            # authenticate ANY local process that can connect.
+                            answer = hmac.new(feed_token.encode("utf-8"),
+                                              ("client|" + chal["n"]).encode("utf-8"),
+                                              hashlib.sha256).hexdigest()
+                            await ws.send(json.dumps({"c": "auth", "r": answer},
                                                      separators=(",", ":")))
                             print(f"ws feed authenticated by challenge: "
                                   f"{_mask_url(path, feed_token)}")
@@ -2403,21 +2411,46 @@ def make_feed_provider(path, trace_path=None, feed_token=""):
                                   f"{_mask_url(path, feed_token)} - only acceptable "
                                   "against a plugin with an empty Feed Token")
                         auth_fails = 0
+                        bad_frames = 0
                         async for msg in ws:
                             try:
                                 frame = json.loads(msg)
                             except json.JSONDecodeError:
+                                # Malformed frames used to be dropped in total
+                                # silence: the socket stayed up and every frame
+                                # was discarded, so markers froze on screen
+                                # until the 1 s staleness rule cleared them.
+                                # Name it once, then every ~10 s at 60 Hz.
+                                bad_frames += 1
+                                if bad_frames == 1 or bad_frames % 600 == 0:
+                                    print(f"ws feed: malformed frame ignored "
+                                          f"({len(msg)} bytes, not JSON, "
+                                          f"{bad_frames} so far) - the plugin "
+                                          f"is sending incomplete frames; markers "
+                                          f"stay frozen until a valid frame or "
+                                          f"the 1 s timeout")
                                 continue
                             tok = frame.get("tok") if isinstance(frame, dict) else None
-                            if feed_token and tok is not None \
-                                    and not hmac.compare_digest(feed_token, str(tok)):
+                            want = None
+                            if feed_token:
+                                ts = frame.get("t") if isinstance(frame, dict) else None
+                                if isinstance(ts, int) and not isinstance(ts, bool):
+                                    # Frame stamp = HMAC over the frame's own
+                                    # timestamp. Fail CLOSED: a frame without a
+                                    # verifiable stamp is rejected, not trusted.
+                                    want = hmac.new(
+                                        feed_token.encode("utf-8"),
+                                        str(ts).encode("utf-8"),
+                                        hashlib.sha256).hexdigest()
+                            if feed_token and (want is None or not isinstance(tok, str)
+                                               or not hmac.compare_digest(want, tok)):
                                 auth_fails += 1
                                 if auth_fails == 1:
-                                    print("ws feed: frame tok stamp mismatch REJECTED "
-                                          "(token drift between plugin cfg and "
-                                          "config.json: token changes take effect only "
-                                          "after restarting the GAME first, then the "
-                                          "overlay)")
+                                    print("ws feed: frame tok stamp missing/mismatched "
+                                          "REJECTED (token drift between plugin cfg and "
+                                          "config.json, or the plugin is older than 1.1: "
+                                          "token changes take effect only after "
+                                          "restarting the GAME first, then the overlay)")
                                 if auth_fails >= 3:
                                     print("ws feed: server redial after token-mismatched frames")
                                     await asyncio.sleep(2.0)
