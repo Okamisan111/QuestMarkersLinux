@@ -59,7 +59,7 @@ ones as pins with name and distance.*
 | You need | Why | Check with |
 |---|---|---|
 | A **Wayland session** (KDE Plasma, GNOME, wlroots) | the overlay is a layer-shell client; on X11/XWayland it cannot be drawn at all | `echo $XDG_SESSION_TYPE` prints `wayland` |
-| SPT installed and running under Wine/Proton | the plugin lives inside the game process | you can play SPT |
+| SPT 4.1 installed and running under Wine/Proton | the plugin lives inside the game process | you can play SPT |
 | BepInEx 5 in your SPT folder | loads the plugin | `<SPT>/BepInEx/core/BepInEx.dll` exists |
 | Python 3.10+ | runs the overlay | `python3 --version` |
 | `pycairo` + `websockets` | drawing and the feed connection | installed in a venv below |
