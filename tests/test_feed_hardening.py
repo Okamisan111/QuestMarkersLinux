@@ -31,14 +31,14 @@ def check(name, passed, detail=""):
 # 1) cfg_of clamps hostile feed-injected cfg
 cfg = overlay.cfg_of({"cfg": {"iconScale": 1e9, "edgeSize": 1e9,
                               "farDistance": 1e12, "scale": "abc",
-                              "smooth": -5, "presenter": "evil",
+                              "smooth": -5,
                               "font": "x" * 5000, "evilKey": 1}})
 check("iconScale clamped", 0.25 <= cfg["iconScale"] <= 4.0, str(cfg["iconScale"]))
 check("edgeSize clamped", 4.0 <= cfg["edgeSize"] <= 192.0, str(cfg["edgeSize"]))
 check("farDistance upper clamp", 1.0 <= cfg["farDistance"] <= 100000.0)
 check("non-numeric scale -> default", cfg["scale"] == overlay.FEATURE_DEFAULTS["scale"])
 check("negative smooth -> 0", cfg["smooth"] == 0.0)
-check("hostile presenter -> default", cfg["presenter"] == overlay.FEATURE_DEFAULTS["presenter"])
+check("removed presenter key stays gone", "presenter" not in cfg)
 check("oversized font rejected", cfg["font"] == overlay.FEATURE_DEFAULTS["font"])
 check("feed cfg cannot inject unknown keys", "evilKey" not in cfg)
 check("removed showLog feature stays gone", "showLog" not in cfg)

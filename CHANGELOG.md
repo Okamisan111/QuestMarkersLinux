@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.2.0 — 2026-11-04
+
+The overlay is now **Wayland-only**.
+
+### Removed
+- **X11 presenter.** A user tried it and got a black screen: under XWayland the
+  depth-32 visual is refused and a depth-24 window cannot carry alpha, so the
+  X11 path could never actually show markers. A fallback that does not work is
+  worse than no fallback, so it is gone: the overlay only drives the native
+  layer-shell presenter.
+- Corresponding switches and keys: `--presenter`, `--test`, `--readback`,
+  `--argb`/`--no-argb`, `--display`, `--keep` and the config keys `presenter`,
+  `readback`, `display`. Unknown keys in an existing `config.json` are ignored,
+  so old config files keep working unchanged.
+- The Xlib ctypes bindings, the SHAPE clip code and the X11 pixel-readback
+  suite went with it (overlay.py: -840 lines, +35). The `tests/` batteries
+  still cover renderer geometry, the wire protocol and the interpolator; only
+  the hardening check that asserted a hostile `presenter` value gets clamped
+  was replaced by one that asserts the key never comes back.
+
+### Requirements
+- A Wayland session (KDE Plasma, GNOME and wlroots compositors). X11 and
+  XWayland are not supported - that is what produced the black screen.
+
 ## v1.1.1 — 2026-11-04
 
 Supersedes the `v1.1.0` tag, which was still built on feed protocol v3: there,

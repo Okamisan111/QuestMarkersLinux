@@ -1,51 +1,44 @@
 #!/usr/bin/env python3
-"""Native quest marker overlay for SPT (Escape From Tarkov).
+"""Native quest marker overlay for SPT (Escape From Tarkov) - Wayland only.
 
-Transparent, frameless, click-through X11 overlay window positioned exactly
-over the game window. Marker data comes from the bundled BepInEx plugin (live
-WebSocket feed) or from a latest.json writer such as feed_sim.py.
+Transparent, frameless, click-through overlay surface on your game monitor.
+Marker data comes from the bundled BepInEx plugin (live WebSocket feed) or
+from a latest.json writer such as feed_sim.py.
 
-Why this architecture:
-- pycairo >= 1.28 has no constructible XlibSurface from Python, and the
-  cached wheels have no X support at all. So X11 is driven via ctypes
-  (libX11/libXext) and rendering happens in cairo ImageSurfaces, one small
-  surface per marker box, transferred with XPutImage.
-- The root is depth 24 and there is NO COMPOSITE compositor: depth-32
-  windows under root are a BadMatch and per-pixel alpha is impossible.
-  Transparency: SHAPE ShapeClip = union of marker boxes (background_pixmap
-  None -> the server never clears outside the clip). Click-through:
-  ShapeInput = empty region -> all clicks reach the game.
+Why a native layer-shell presenter:
+- The overlay is a wlr-layer-shell client (`wayland/wayland_present`), so the
+  compositor itself blends the alpha channel: no compositing tricks, no
+  per-window clipping and real per-pixel transparency on KDE/GNOME/wlroots.
+- Rendering stays in Python/cairo: each marker becomes a small ARGB surface,
+  and only the dirty rectangles are piped to the presenter (~6 KB per frame
+  instead of a full 14 MB surface at 30 Hz).
+- X11 is deliberately NOT supported. Under XWayland the depth-32 visual is
+  refused and depth-24 windows cannot carry alpha, which yields a black
+  screen instead of an overlay.
 
 Run (venv with pycairo, see README):
   .venv/bin/python3 overlay.py [options]
 
 Options:
-  --test           draw 4 pure-color test boxes + 1 marker box; pixel
-                   readback, window attributes, stacking order,
-                   ShapeClip/ShapeInput proofs -> PASS/FAIL exit code
   --feed SOURCE    feed source: path to latest.json (feed_sim.py output,
                    file:// also accepted) or a
-                   ws://host:9378 URL (QuestMarkersLinux Bridge plugin;
-                   feedToken from config.json is appended automatically)
+                   ws://host:9378 URL (QuestMarkersLinux plugin; the feed
+                   token from config.json is used for the challenge
+                   handshake, never appended to the URL)
   --seconds N      run duration for --feed (default 0 = run until Ctrl-C)
   --hz FLOAT       feed render rate, clamped to 1..300 (default 120)
   --config PATH    JSON feature defaults; default config.json lives NEXT TO
                    overlay.py regardless of launch directory; CLI flags win
-  --geometry WxH+X+Y   window placement (default fullscreen at 0,0)
-  --presenter wayland|x11   wayland layer-shell (default, real alpha) or X11
-  --readback       sample box pixels every ~1 s during --feed
-  --keep           keep the window open after the run ends
+  --geometry WxH+X+Y   overlay surface placement (default fullscreen at 0,0)
 """
 
 import argparse
-import ctypes
 import hashlib
 import hmac
 import json
 import re
 import math
 import os
-import shutil
 import subprocess
 import struct
 import sys
@@ -61,197 +54,6 @@ import cairo
 # truly transparent overlay.
 PRESENTER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "wayland", "wayland_present")
-
-# ---------------------------------------------------------------------------
-# X11 via ctypes
-# ---------------------------------------------------------------------------
-
-X11 = ctypes.CDLL("libX11.so.6")
-XEXT = ctypes.CDLL("libXext.so.6")
-LIBC = ctypes.CDLL("libc.so.6")
-
-# X.h constants
-INPUT_OUTPUT = 0
-# X.h exact: CWBackPixmap=1<<0, CWBackPixel=1<<1, CWBorderPixel=1<<3,
-# CWColormap=1<<5, CWCursor=1<<6, CWOverrideRedirect=1<<9, CWEventMask=1<<11
-CW_BACKPIXMAP = 1 << 0
-CW_BACKPIXEL = 1 << 1
-CW_BORDERPIXEL = 1 << 3
-CW_COLORMAP = 1 << 5
-CW_EVENTMASK = 1 << 11
-CW_OVERRIDEREDIRECT = 1 << 9
-CW_CURSOR = 1 << 6
-BACKGROUND_NONE = 0  # BackgroundPixmap None
-ZPIXMAP = 2
-ALLOC_NONE = 0
-SHAPE_BOUNDING = 0
-SHAPE_CLIP = 1
-SHAPE_INPUT = 2
-SHAPE_SET = 0
-SHAPE_UNION = 1
-COORD_ORIGIN = 0
-IS_VIEWABLE = 2
-XC_ARROW = 100
-
-
-class XSetWindowAttributes(ctypes.Structure):
-    _fields_ = [
-        ("background_pixmap", ctypes.c_ulong),
-        ("background_pixel", ctypes.c_ulong),
-        ("border_pixmap", ctypes.c_ulong),
-        ("border_pixel", ctypes.c_ulong),
-        ("bit_gravity", ctypes.c_int),
-        ("win_gravity", ctypes.c_int),
-        ("backing_store", ctypes.c_int),
-        ("backing_planes", ctypes.c_ulong),
-        ("backing_pixel", ctypes.c_ulong),
-        ("save_under", ctypes.c_int),
-        ("event_mask", ctypes.c_long),
-        ("do_not_propagate_mask", ctypes.c_long),
-        ("override_redirect", ctypes.c_int),
-        ("colormap", ctypes.c_ulong),
-        ("cursor", ctypes.c_ulong),
-    ]
-
-
-class XRectangle(ctypes.Structure):
-    _fields_ = [
-        ("x", ctypes.c_short),
-        ("y", ctypes.c_short),
-        ("width", ctypes.c_ushort),
-        ("height", ctypes.c_ushort),
-    ]
-
-
-class XVisualInfo(ctypes.Structure):
-    """Xlib XVisualInfo: 64 bytes on LP64 (padding after `class` and `bits_per_rgb`)."""
-    _fields_ = [
-        ("visual", ctypes.c_void_p),
-        ("visualid", ctypes.c_ulong),
-        ("screen", ctypes.c_int),
-        ("depth", ctypes.c_int),
-        ("c_class", ctypes.c_int),
-        ("red_mask", ctypes.c_ulong),
-        ("green_mask", ctypes.c_ulong),
-        ("blue_mask", ctypes.c_ulong),
-        ("colormap_size", ctypes.c_int),
-        ("bits_per_rgb", ctypes.c_int),
-    ]
-
-
-class XWindowAttributes(ctypes.Structure):
-
-    _fields_ = [
-        ("x", ctypes.c_int),
-        ("y", ctypes.c_int),
-        ("width", ctypes.c_int),
-        ("height", ctypes.c_int),
-        ("border_width", ctypes.c_int),
-        ("depth", ctypes.c_int),
-        ("visual", ctypes.c_void_p),
-        ("root", ctypes.c_ulong),
-        ("c_class", ctypes.c_int),
-        ("bit_gravity", ctypes.c_int),
-        ("win_gravity", ctypes.c_int),
-        ("backing_store", ctypes.c_int),
-        ("backing_planes", ctypes.c_ulong),
-        ("backing_pixel", ctypes.c_ulong),
-        ("save_under", ctypes.c_int),
-        ("colormap", ctypes.c_ulong),
-        ("map_installed", ctypes.c_int),
-        ("map_state", ctypes.c_int),
-        ("all_event_masks", ctypes.c_long),
-        ("your_event_mask", ctypes.c_long),
-        ("do_not_propagate_mask", ctypes.c_long),
-        ("override_redirect", ctypes.c_int),
-        ("screen", ctypes.c_void_p),
-    ]
-
-
-def _decl(lib, name, restype, argtypes):
-    fn = getattr(lib, name)
-    fn.restype = restype
-    fn.argtypes = argtypes
-    return fn
-
-
-VP = ctypes.c_void_p
-UL = ctypes.c_ulong
-I = ctypes.c_int
-U = ctypes.c_uint
-P = ctypes.POINTER
-
-_open_display = _decl(X11, "XOpenDisplay", VP, [ctypes.c_char_p])
-_default_visual = _decl(X11, "XDefaultVisual", VP, [VP, I])
-_default_depth = _decl(X11, "XDefaultDepth", I, [VP, I])
-_display_width = _decl(X11, "XDisplayWidth", I, [VP, I])
-_display_height = _decl(X11, "XDisplayHeight", I, [VP, I])
-_root_window = _decl(X11, "XRootWindow", UL, [VP, I])
-_create_colormap = _decl(X11, "XCreateColormap", UL, [VP, UL, VP, I])
-# XCreateWindow(dpy, parent, x, y, w, h, border_width, depth, class, visual, mask, attrs)
-_create_window = _decl(
-    X11, "XCreateWindow", UL,
-    [VP, UL, I, I, U, U, U, I, U, VP, UL, P(XSetWindowAttributes)],
-)
-_create_gc = _decl(X11, "XCreateGC", VP, [VP, UL, UL, VP])
-_create_font_cursor = _decl(X11, "XCreateFontCursor", UL, [VP, I])
-_map_raised = _decl(X11, "XMapRaised", None, [VP, UL])
-_raise_window = _decl(X11, "XRaiseWindow", None, [VP, UL])
-_unmap_window = _decl(X11, "XUnmapWindow", None, [VP, UL])
-_destroy_window = _decl(X11, "XDestroyWindow", None, [VP, UL])
-_sync = _decl(X11, "XSync", None, [VP, I])
-_set_foreground = _decl(X11, "XSetForeground", I, [VP, VP, UL])
-_free_gc = _decl(X11, "XFreeGC", I, [VP, VP])
-_fill_rectangle = _decl(X11, "XFillRectangle", I, [VP, UL, VP, I, I, U, U])
-_create_image = _decl(
-    X11, "XCreateImage", VP,
-    [VP, VP, U, I, I, VP, U, U, I, I],
-)
-_put_image = _decl(
-    X11, "XPutImage", I,
-    [VP, UL, VP, VP, I, I, I, I, U, U],
-)
-_get_image = _decl(
-    X11, "XGetImage", VP,
-    [VP, UL, I, I, U, U, UL, I],
-)
-_get_pixel = _decl(X11, "XGetPixel", UL, [VP, I, I])
-_destroy_image = _decl(X11, "XDestroyImage", I, [VP])
-_get_geometry = _decl(
-    X11, "XGetGeometry", I,
-    [VP, UL, P(UL), P(I), P(I), P(U), P(U), P(U), P(U)],
-)
-_get_window_attributes = _decl(X11, "XGetWindowAttributes", I, [VP, UL, P(XWindowAttributes)])
-_query_tree = _decl(
-    X11, "XQueryTree", I,
-    [VP, UL, P(UL), P(UL), P(P(UL)), P(U)],
-)
-_free = _decl(X11, "XFree", I, [VP])
-_close_display = _decl(X11, "XCloseDisplay", I, [VP])
-_shape_combine_rectangles = _decl(
-    XEXT, "XShapeCombineRectangles", None,
-    [VP, UL, I, I, I, P(XRectangle), I, I, I],
-)
-_shape_get_rectangles = _decl(
-    XEXT, "XShapeGetRectangles", P(XRectangle),
-    [VP, UL, I, P(I), P(I)],
-)
-_shape_combine_mask = _decl(
-    XEXT, "XShapeCombineMask", None,
-    [VP, UL, I, I, I, UL, I],
-)
-_create_pixmap = _decl(X11, "XCreatePixmap", UL, [VP, UL, U, U, U])
-_free_pixmap = _decl(X11, "XFreePixmap", I, [VP, UL])
-_match_visual_info = _decl(X11, "XMatchVisualInfo", I,
-                           [VP, I, I, I, P(XVisualInfo)])
-TRUE_COLOR = 4  # Xlib TrueColor visual class
-
-libc_malloc = LIBC.malloc
-libc_malloc.restype = VP
-libc_malloc.argtypes = [ctypes.c_size_t]
-libc_memmove = LIBC.memmove
-libc_memmove.restype = VP
-libc_memmove.argtypes = [VP, ctypes.c_char_p, ctypes.c_size_t]
 
 # ---------------------------------------------------------------------------
 # Marker rendering (cairo ImageSurface per box, DOM-like appearance)
@@ -311,7 +113,6 @@ FEATURE_DEFAULTS = {
     "iconScale": 1.0,        # symbol multiplier: pin geometry + kind icon
                              # (text stays readable). 1.0 is the standard size
                              # = 1.7x original pin baked in as ICON_BASE
-    "presenter": "wayland",  # Presenter: "wayland" | "x11"
     "font": "Chakra Petch",  # Font: maschine's bundled font name (upstream's
                              # "Use the bundled font" - set "" for system default)
 }
@@ -528,7 +329,7 @@ def cfg_of(feed=None):
         if not isinstance(user_cfg, dict):
             raise ValueError("config must be a JSON object")
         for key in ("labels", "distance", "edge", "scale", "farDistance",
-                    "farScale", "imperial", "edgeSize", "presenter", "font",
+                    "farScale", "imperial", "edgeSize", "font",
                     "iconScale", "smooth"):
             if key in user_cfg:
                 cfg[key] = user_cfg[key]
@@ -548,8 +349,6 @@ def cfg_of(feed=None):
         cfg[key] = max(lo, min(hi, val)) if val is not None else FEATURE_DEFAULTS[key]
     for key in ("labels", "distance", "edge", "imperial"):
         cfg[key] = _flag(cfg[key], FEATURE_DEFAULTS[key])
-    if cfg["presenter"] not in ("wayland", "x11"):
-        cfg["presenter"] = FEATURE_DEFAULTS["presenter"]
     if not isinstance(cfg["font"], str) or len(cfg["font"]) > 128:
         cfg["font"] = FEATURE_DEFAULTS["font"]
     return cfg
@@ -1156,139 +955,6 @@ def make_edge_surface(e, W, H):
     return surf, rx, ry
 
 
-def shape_mask(xd, win, gc, x, y, surf):
-    """Union the surface's painted (alpha>0) pixels into ShapeClip:
-    pixel-exact teardrop/arrow/box clip, no rectangular halo. The mask is
-    built from row-run XFillRectangles on a depth-1 pixmap (XPutImage on
-    1bpp XImages is BadMatch server-side; fill-runs are reliable)."""
-    w, h = surf.get_width(), surf.get_height()
-    stride = surf.get_stride()
-    data = bytes(surf.get_data())
-    pm = _create_pixmap(xd, win, w, h, 1)
-    mgc = _create_gc(xd, pm, 0, None)  # GC depth must match pm depth (BadMatch else)
-    _set_foreground(xd, mgc, 1)
-    for yy in range(h):
-        off = yy * stride
-        run = None
-        for xx in range(w):
-            if data[off + xx * 4 + 3] > 0:
-                if run is None:
-                    run = xx
-            elif run is not None:
-                _fill_rectangle(xd, pm, mgc, run, yy, xx - run, 1)
-                run = None
-        if run is not None:
-            _fill_rectangle(xd, pm, mgc, run, yy, w - run, 1)
-    _shape_combine_mask(xd, win, SHAPE_CLIP, x, y, pm, SHAPE_UNION)
-    _free_gc(xd, mgc)
-    _free_pixmap(xd, pm)
-
-
-def clip_reset(xd, win, gc):
-    """Frame start: Replace ShapeClip with an empty 1x1 mask."""
-    pm = _create_pixmap(xd, win, 1, 1, 1)
-    mgc = _create_gc(xd, pm, 0, None)
-    _fill_rectangle(xd, pm, mgc, 0, 0, 1, 1)
-    _shape_combine_mask(xd, win, SHAPE_CLIP, 0, 0, pm, 0)  # op Replace
-    _free_gc(xd, mgc)
-    _free_pixmap(xd, pm)
-
-
-def readback_region(xd, win, x, y, w, h):
-    img = _get_image(xd, win, x, y, w, h, 0xFFFFFF, ZPIXMAP)
-    if not img:
-        return [[None] * w for _ in range(h)]
-    out = []
-    for yy in range(h):
-        row = []
-        for xx in range(w):
-            v = _get_pixel(img, xx, yy)
-            row.append(((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF))
-        out.append(row)
-    _destroy_image(img)
-    return out
-
-
-def _count_color(region, color, tol=3):
-    return sum(1 for row in region for px in row
-               if px is not None and all(abs(px[i] - color[i]) <= tol
-                                          for i in range(3)))
-
-
-def visual_marker_checks(xd, win, marker, surf, bx, by):
-    """DOM contract checks on the live window: tip anchored at feed (x, y)
-    within 2 px, icon color at pin circle center, box bg/label/dist/gold
-    border colors read back pixel-true."""
-    mx, my = int(marker["x"]), int(marker["y"])
-    out = []
-    tip_c = kind_color(marker["k"], marker.get("s"))
-    region = readback_region(xd, win, mx - 20, my - 5, 40, 6)
-    xs = [mx - 20 + j for row in region for j, px in enumerate(row)
-          if px and all(abs(px[i] - tip_c[i]) <= 3 for i in range(3))]
-    c = sum(xs) / len(xs) if xs else None
-    out.append(("pin tip centered on feed x", c, mx,
-                c is not None and abs(c - mx) <= 2))
-    icx, icy = mx, my - int(round(TIP_OFF))
-    ck = kind_color(marker["k"], marker.get("s"))
-    icon_region = readback_region(xd, win, icx - 7, icy - 7, 15, 15)
-    # icon strokes are 1.25 px AA'd (2 px sheet * 15/24 scale) so only ~7-11
-    # pixels reach the pure accent; the old >=20 bound was tuned to the
-    # pre-AA sheet. >=5 still fails hard (0) if colors clamp to white.
-    n_icon = _count_color(icon_region, ck)
-    out.append((f"pin icon accent px @ {icx},{icy}", n_icon, n_icon >= 5,
-                n_icon >= 5))
-    msz = _marker_sizes(marker)
-    tipy = int(round(PIN_TOPS.get(PIN_SHAPE.get(marker["k"], "teardrop"),
-                                  PIN_TOPS["teardrop"]) * msz["pin"]))
-    box_top = by + tipy + 1 + msz["gap"]  # tagbox hangs below the tip (DOM layout)
-    box_h = surf.get_height() - (tipy + 1 + msz["gap"])
-    region = readback_region(xd, win, bx, box_top, surf.get_width(), box_h)
-    n_bg = _count_color(region, BOX_BG)
-    n_lab = _count_color(region, LABEL_COLOR)
-    n_dist = _count_color(region, DIST_COLOR)
-    n_bord = _count_color(region, PIN_BORDER)
-    out.append(("box background px", n_bg, ">=10", n_bg >= 10))
-    out.append(("label text px", n_lab, ">=20", n_lab >= 20))
-    out.append(("dist text px", n_dist, ">=20", n_dist >= 20))
-    out.append(("gold border px", n_bord, ">=8", n_bord >= 8))
-    return out
-
-
-def put_surface(xd, win, gc, visual, depth, surf, x, y):
-    """XPutImage a cairo ImageSurface onto the overlay window at (x, y)."""
-    w, h = surf.get_width(), surf.get_height()
-    stride = surf.get_stride()
-    data = bytes(surf.get_data())
-    # XDestroyImage frees image->data with Xfree, so hand it malloc'ed memory
-    buf = libc_malloc(len(data))
-    libc_memmove(buf, data, len(data))
-    img = _create_image(xd, visual, depth, ZPIXMAP, 0, buf, w, h, 32, stride)
-    _put_image(xd, win, gc, img, 0, 0, x, y, w, h)
-    _destroy_image(img)  # frees buf too
-
-
-def shape_rects(xd, win, rects, kind):
-    if not rects:
-        _shape_combine_rectangles(xd, win, kind, 0, 0, None, 0, SHAPE_SET, COORD_ORIGIN)
-        return
-    arr = (XRectangle * len(rects))()
-    for i, (x, y, w, h) in enumerate(rects):
-        arr[i].x = x
-        arr[i].y = y
-        arr[i].width = w
-        arr[i].height = h
-    _shape_combine_rectangles(xd, win, kind, 0, 0, arr, len(rects), SHAPE_SET, COORD_ORIGIN)
-
-
-def readback_pixel(xd, win, x, y):
-    img = _get_image(xd, win, x, y, 1, 1, 0xFFFFFF, ZPIXMAP)
-    if not img:
-        return None
-    px = _get_pixel(img, 0, 0)
-    _destroy_image(img)
-    return (px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF
-
-
 def parse_geometry(s):
     import re
     m = re.match(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$", s)
@@ -1296,45 +962,6 @@ def parse_geometry(s):
         sys.exit(f"bad geometry: {s}")
     return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
 
-
-def find_argb_visual(xd, screen=0):
-    """32-bit ARGB TrueColor visual: per-pixel alpha handled by the compositor.
-
-    The m3 Shape-clip path only works where the WM honours SHAPE on an
-    override-redirect window. KWin (Wayland/XWayland) does not: the window
-    stays fully opaque black. An ARGB visual fixes that at the source.
-    Returns (visual, 32) or (None, 0) when the screen has no depth-32 visual.
-    """
-    vi = XVisualInfo()
-    if not _match_visual_info(xd, screen, 32, TRUE_COLOR, ctypes.byref(vi)):
-        return None, 0
-    return ctypes.c_void_p(vi.visual), 32
-
-
-def create_window(xd, w, h, x, y, visual, depth):
-    root = _root_window(xd, 0)
-    cmap = _create_colormap(xd, root, visual, ALLOC_NONE)
-    cursor = _create_font_cursor(xd, XC_ARROW)
-    attrs = XSetWindowAttributes()
-    attrs.background_pixmap = BACKGROUND_NONE  # no clearing outside the clip
-    attrs.colormap = cmap
-    attrs.cursor = cursor
-    attrs.override_redirect = 1
-    attrs.event_mask = 0  # no events -> Xlib buffer stays clean
-    mask = CW_BACKPIXMAP | CW_COLORMAP | CW_EVENTMASK | CW_OVERRIDEREDIRECT | CW_CURSOR
-    win = _create_window(xd, root, x, y, w, h, 0, depth, INPUT_OUTPUT, visual,
-                         mask, ctypes.byref(attrs))
-    return win
-
-
-def map_and_raise(xd, win):
-    _map_raised(xd, win)
-    _sync(xd, 0)
-
-
-# ---------------------------------------------------------------------------
-# Feed reading
-# ---------------------------------------------------------------------------
 
 def read_feed(path):
     """Read latest.json; None on missing file AND on stale content: the feed
@@ -1410,261 +1037,6 @@ def smooth_pos(state, key, x, y, tau):
         dx, dy = tx, ty
     state[key] = [m1x, m1y, t1, m2x, m2y, t2, dx, dy, now]
     return dx, dy
-def blit(ctx, surf, x, y):
-    """Composite a marker surface onto the frame canvas without bleeding."""
-    ctx.save()
-    ctx.rectangle(x, y, surf.get_width(), surf.get_height())
-    ctx.clip()
-    ctx.set_source_surface(surf, x, y)
-    ctx.paint()
-    ctx.restore()
-
-
-def paint_canvas(canvas, feed, smooth=0.0, state=None):
-    """Paint one feed frame onto a transparent ARGB32 canvas (no X11 involved).
-
-    Used by the Wayland presenter path, where the compositor does the alpha
-    blending and no shape clip is needed at all.
-    """
-    ctx = cairo.Context(canvas)
-    ctx.set_operator(cairo.OPERATOR_SOURCE)
-    ctx.set_source_rgba(0, 0, 0, 0)
-    ctx.paint()
-    ctx.set_operator(cairo.OPERATOR_OVER)
-    if "smooth" in (feed.get("cfg") or {}):
-        smooth = max(0.0, min(3.0, float(feed["cfg"]["smooth"])))
-    rects = []
-    for m in feed.get("m", []):
-        if smooth > 0.0 and state is not None:
-            key = (m.get("k"), m.get("l"), m.get("s"))
-            m = dict(m)
-            m["x"], m["y"] = smooth_pos(state, key, m["x"], m["y"], smooth)
-        r = render_marker(m)
-        if r is None:
-            continue
-        surf, bx, by = r
-        blit(ctx, surf, bx, by)
-        rects.append((bx, by, surf.get_width(), surf.get_height()))
-    if state is not None:
-        # markers that vanished from the feed must not keep stale state
-        live = {(m.get("k"), m.get("l"), m.get("s")) for m in feed.get("m", [])}
-        for key in list(state):
-            if key not in live:
-                del state[key]
-    for e in feed.get("e", []):
-        if e.get("op", 1.0) <= 0:
-            continue
-        vw, vh = feed.get("v", [canvas.get_width(), canvas.get_height()])
-        surf = make_edge_surface(e, vw, vh)
-        ex, ey = int(e["x"]), int(e["y"])
-        blit(ctx, surf, ex, ey)
-        rects.append((ex, ey, surf.get_width(), surf.get_height()))
-    canvas.flush()
-    return rects
-
-
-def _v1_compat(feed):
-    """Protocol v2 (nx/ny normalized, b flag) -> legacy x/y pixel feed for
-    the X11 presenter path.
-
-    The X11 renderer reads m["x"]/m["y"] directly; feeding it v2 frames
-    crashed it with KeyError 'x' on the very first frame. Behind-camera and
-    fully off-screen markers are DROPPED here (same anti-mirror rule as the
-    wayland path: mirrored coords must never render mid-screen; edge arrows
-    remain a wayland-path feature). Legacy feeds pass through untouched.
-    """
-    try:
-        vw, vh = feed.get("v", [2560, 1440])
-        vw, vh = float(vw), float(vh)
-        if not (math.isfinite(vw) and math.isfinite(vh) and vw >= 1.0 and vh >= 1.0):
-            raise ValueError
-    except (TypeError, ValueError):
-        vw, vh = 2560.0, 1440.0
-    markers = feed.get("m") or []
-    out = None
-    for idx, m in enumerate(markers):
-        nx, ny = m.get("nx"), m.get("ny")
-        if nx is None or ny is None:
-            continue  # already legacy x/y - keep as is
-        if out is None:
-            out = list(markers)
-        try:
-            x, y = float(nx) * vw, float(ny) * vh
-        except (TypeError, ValueError):
-            out[idx] = None
-            continue
-        behind = m.get("b")
-        if behind is None:
-            behind = 1 if (x < 0 or x > vw or y < 0 or y > vh) else 0
-        if int(behind) or (x < -0.1 * vw or x > 1.1 * vw
-                           or y < -0.1 * vh or y > 1.1 * vh):
-            out[idx] = None
-            continue
-        mm = dict(m)
-        mm["x"], mm["y"] = x, y
-        out[idx] = mm
-    if out is None:
-        return feed  # pure legacy feed: zero-copy
-    out = [m for m in out if m is not None]
-    feed = dict(feed)
-    feed["m"] = out
-    return feed
-
-
-def draw_feed_frame(xd, win, gc, visual, depth, feed, smooth=0.0, state=None,
-                    canvas=None):
-    """Draw one feed frame.
-
-    canvas=None -> Shape-clip path (depth 24, m3 behaviour).
-    canvas=ARGB surface -> per-pixel alpha, whole frame in one XPutImage.
-    """
-    if "smooth" in ((feed.get("cfg") or {}) if isinstance(feed, dict) else {}):
-        smooth = max(0.0, min(3.0, float(feed["cfg"]["smooth"])))
-    feed = _v1_compat(feed)
-    if canvas is not None:
-        rects = paint_canvas(canvas, feed, smooth, state)
-        put_surface(xd, win, gc, visual, depth, canvas, 0, 0)
-        _sync(xd, 0)
-        return rects
-    clip_reset(xd, win, gc)
-    rects = []
-    for m in feed.get("m", []):
-        if smooth > 0.0 and state is not None:
-            key = (m.get("k"), m.get("l"), m.get("s"))
-            m = dict(m)
-            m["x"], m["y"] = smooth_pos(state, key, m["x"], m["y"], smooth)
-        r = render_marker(m)
-        if r is None:
-            continue
-        surf, bx, by = r
-        shape_mask(xd, win, gc, bx, by, surf)  # Clip FIRST, dann malen
-        put_surface(xd, win, gc, visual, depth, surf, bx, by)
-        rects.append((bx, by, surf.get_width(), surf.get_height()))
-    if state is not None:
-        # markers that vanished from the feed must not keep stale state
-        live = {(m.get("k"), m.get("l"), m.get("s")) for m in feed.get("m", [])}
-        for key in list(state):
-            if key not in live:
-                del state[key]
-    for e in feed.get("e", []):
-        if e.get("op", 1.0) <= 0:
-            continue
-        vw, vh = feed.get("v", [2560, 1440])
-        surf = make_edge_surface(e, vw, vh)
-        ex, ey = int(e["x"]), int(e["y"])
-        shape_mask(xd, win, gc, ex, ey, surf)  # Clip FIRST, dann malen
-        put_surface(xd, win, gc, visual, depth, surf, ex, ey)
-        rects.append((ex, ey, surf.get_width(), surf.get_height()))
-    _sync(xd, 0)
-    return rects
-
-
-# ---------------------------------------------------------------------------
-# Modes
-# ---------------------------------------------------------------------------
-
-def run_test(xd, win, gc, visual, depth, W, H, X, Y):
-    checks = []
-
-    boxes = [
-        (100, 100, 60, 40, (0, 255, 0)),
-        (200, 100, 60, 40, (255, 0, 0)),
-        (100, 200, 60, 40, (0, 0, 255)),
-        (200, 200, 60, 40, (255, 255, 0)),
-    ]
-    rects = []
-    for (x, y, w, h, color) in boxes:
-        _set_foreground(xd, gc, color[0] << 16 | color[1] << 8 | color[2])
-        _fill_rectangle(xd, win, gc, x, y, w, h)
-        rects.append((x, y, w, h))
-
-    shape_rects(xd, win, rects, SHAPE_CLIP)   # Set: zuerst die 4 Testboxen
-    marker = {"k": "zone", "x": W / 2, "y": H / 2, "op": 1.0,
-              "l": "Zielzone", "d": "123 m", "s": None}
-    surf, bx, by = render_marker(marker)
-    shape_mask(xd, win, gc, bx, by, surf)     # Union FIRST: Clip muss den Marker enthalten
-    put_surface(xd, win, gc, visual, depth, surf, bx, by)
-    rects.append((bx, by, surf.get_width(), surf.get_height()))
-    # DOM-Kantenpfeil (div.edge): zone, linker Rand, zeigt nach links
-    e = {"k": "zone", "x": 10, "y": H // 2 - 20, "w": 24, "h": 20, "op": 1.0,
-         "sd": "L", "d": "350 m"}
-    esurf, ex, ey = make_edge_surface(e, W, H)
-    shape_mask(xd, win, gc, ex, ey, esurf)
-    put_surface(xd, win, gc, visual, depth, esurf, ex, ey)
-    rects.append((ex, ey, esurf.get_width(), esurf.get_height()))
-    shape_rects(xd, win, [], SHAPE_INPUT)  # empty -> click-through
-    _sync(xd, 0)
-
-    # 1. pixel readback of pure boxes
-    for (x, y, w, h, color) in boxes:
-        got = readback_pixel(xd, win, x + w // 2, y + h // 2)
-        ok = got == color
-        checks.append((f"box@{x},{y} center pixel", got, color, ok))
-
-    # 2. DOM-Visus-Checks + Kantenpfeil-Füllung
-    checks.extend(visual_marker_checks(xd, win, marker, surf, bx, by))
-    er = readback_region(xd, win, 10, H // 2 - 20, 24, 20)
-    n_zone = _count_color(er, KIND_COLORS["zone"])
-    checks.append(("edge arrow zone px", n_zone, ">=15", n_zone >= 15))
-
-    # 3. window geometry + attributes
-    root2 = ctypes.c_ulong()
-    gx, gy, gw, gh = ctypes.c_int(), ctypes.c_int(), ctypes.c_uint(), ctypes.c_uint()
-    bw, dep = ctypes.c_uint(), ctypes.c_uint()
-    _get_geometry(xd, win, ctypes.byref(root2), ctypes.byref(gx), ctypes.byref(gy),
-                  ctypes.byref(gw), ctypes.byref(gh), ctypes.byref(bw), ctypes.byref(dep))
-    ok = (gx.value, gy.value, gw.value, gh.value, dep.value) == (X, Y, W, H, 24)
-    checks.append((f"geometry {gx.value}x{gh.value}+{gx.value}+{gy.value} depth={dep.value}",
-                   (gx.value, gy.value, gw.value, gh.value, dep.value),
-                   (X, Y, W, H, 24), ok))
-    attr = XWindowAttributes()
-    _get_window_attributes(xd, win, ctypes.byref(attr))
-    checks.append(("override_redirect + IsViewable",
-                   (attr.override_redirect, attr.map_state),
-                   (1, IS_VIEWABLE),
-                   attr.override_redirect == 1 and attr.map_state == IS_VIEWABLE))
-
-    # 4. stacking order: overlay is top-level child of root
-    root3, parent = ctypes.c_ulong(), ctypes.c_ulong()
-    children = P(UL)()
-    nchild = ctypes.c_uint()
-    _query_tree(xd, _root_window(xd, 0), ctypes.byref(root3), ctypes.byref(parent),
-                ctypes.byref(children), ctypes.byref(nchild))
-    kids = [children[i] for i in range(nchild.value)]
-    top_ok = kids and kids[-1] == win
-    checks.append(("overlay is top of root children", kids[-1] if kids else None, win, top_ok))
-    _free(children)
-
-    # 5. SHAPE proofs
-    nclip = ctypes.c_int()
-    ur = ctypes.c_int()
-    rects_ret = _shape_get_rectangles(xd, win, SHAPE_CLIP, ctypes.byref(nclip), ctypes.byref(ur))
-    clip_ok = nclip.value >= 1
-    checks.append((f"ShapeClip non-empty n={nclip.value}", nclip.value, ">=1", clip_ok))
-    ninput = ctypes.c_int()
-    rects_in = _shape_get_rectangles(xd, win, SHAPE_INPUT, ctypes.byref(ninput), ctypes.byref(ur))
-    input_ok = ninput.value == 0
-    checks.append((f"ShapeInput empty (click-through) n={ninput.value}", ninput.value, 0, input_ok))
-    _free(rects_ret)
-    _free(rects_in)
-
-    print(f"TEST: overlay window 0x{win:x} on {W}x{H}")
-    all_ok = True
-    for name, got, want, ok in checks:
-        print(f"  [{'PASS' if ok else 'FAIL'}] {name}: got={got} want={want}")
-        all_ok = all_ok and ok
-    print("RESULT:", "PASS" if all_ok else "FAIL")
-    return 0 if all_ok else 1
-
-
-def clip_count(xd, win):
-    """Number of pieces in ShapeClip; 1 = cleared (1x1 empty mask)."""
-    n = ctypes.c_int(0)
-    ordering = ctypes.c_int(0)
-    _shape_get_rectangles(xd, win, SHAPE_CLIP, ctypes.byref(n), ctypes.byref(ordering))
-    return n.value
-
-
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "logs", "overlay.log")
 
@@ -1707,113 +1079,6 @@ class _Tee:
                 fh.flush()
             except Exception:
                 pass
-
-
-def argb_probe_ok(xd, visual, depth):
-    """Is a depth-32 window actually creatable on this server?
-
-    Xwayland advertises depth-32 visuals but REFUSES depth-32 windows with an
-    async BadMatch that aborts raw inside Xlib (no Python error). Probe with
-    an off-screen 1x1 window under a temporary X error handler and turn the
-    crash into a controlled fallback decision.
-    """
-    handler_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
-    seen = []
-
-    def _cb(_event):
-        seen.append(1)
-        return 0
-
-    bound = handler_t(_cb)
-    set_eh = _decl(X11, "XSetErrorHandler", ctypes.c_void_p, [handler_t])
-    old = set_eh(bound)
-    try:
-        win = create_window(xd, 1, 1, -200, -200, visual, depth)
-        _sync(xd, 0)   # flush + absorb server errors -> _cb fires if refused
-        ok = not seen
-        _destroy_window(xd, win)
-        _sync(xd, 0)
-        return ok
-    finally:
-        try:
-            if old:
-                set_eh(ctypes.cast(old, handler_t))
-        except Exception:
-            pass
-
-
-def run_feed(xd, win, gc, visual, depth, path, seconds, hz, readback,
-            smooth=0.0, canvas=None, debug=False, trace=None, feed_token=""):
-    shape_rects(xd, win, [], SHAPE_INPUT)
-    _sync(xd, 0)
-    t0 = time.time()
-    last_readback = 0.0
-    dbg_last = 0.0
-    get_feed = make_feed_provider(path, trace, feed_token)
-    frames = 0
-    sm_state = {}
-    had_feed = False
-    miss_since = 0.0
-    x11_errs = [0]
-    while True:
-        now = time.time()
-        if seconds and now - t0 >= seconds:
-            break
-        feed = get_feed()
-        if feed is None:
-            # Raid end / game exit: the HUD feed stops. Clear the overlay
-            # after 1 s grace (transient write gaps must not flicker).
-            if had_feed and now - miss_since >= 1.0:
-                if canvas is not None:
-                    ctx = cairo.Context(canvas)
-                    ctx.set_operator(cairo.OPERATOR_SOURCE)
-                    ctx.set_source_rgba(0, 0, 0, 0)
-                    ctx.paint()
-                    put_surface(xd, win, gc, visual, depth, canvas, 0, 0)
-                    cleared = "argb"
-                else:
-                    clip_reset(xd, win, gc)
-                    cleared = f"clip={clip_count(xd, win)}"
-                _sync(xd, 0)
-                had_feed = False
-                print(f"[feed f{frames}] feed lost -> overlay cleared ({cleared})")
-            if not had_feed:
-                miss_since = now
-            time.sleep(1.0 / hz)
-            continue
-        if not had_feed:
-            had_feed = True
-            miss_since = now
-        try:
-            rects = draw_feed_frame(xd, win, gc, visual, depth, feed,
-                                    smooth, sm_state, canvas=canvas)
-            _raise_window(xd, win)
-            _sync(xd, 0)
-        except Exception as exc:
-            # The wayland presenter path has per-frame guards (sanitize +
-            # frame try); this X11 path had none: one hostile or broken frame
-            # killed the whole feed loop and left the X window behind.
-            _render_failed("x11 frame", exc, x11_errs)
-            time.sleep(1.0 / hz)
-            continue
-        frames += 1
-        if debug and now - dbg_last >= 2.0:
-            dbg_last = now
-            t_ms = float(feed.get("t", now * 1000.0))
-            print(f"[debug f{frames}] rects={len(rects)} feed_age="
-                  f"{(now * 1000.0 - t_ms) / 1000.0:.2f}s rate~={frames / (now - t0):.1f}Hz "
-                  f"smooth={smooth if smooth else 'off'}")
-        if readback and now - last_readback >= 1.0:
-            last_readback = now
-            mode = "argb" if canvas is not None else f"clip={clip_count(xd, win)}"
-            print(f"[feed f{frames}] {mode}, boxes={len(rects)}")
-            if rects:
-                bx, by, bw, bh = rects[0]
-                px = readback_pixel(xd, win, bx + bw // 2, by + bh // 2)
-                print(f"  px@{bx + bw // 2},{by + bh // 2} = {px}")
-        time.sleep(max(0.0, 1.0 / hz - (time.time() - now)))
-    print(f"feed done: {frames} frames, {_mask_url(path, feed_token)}")
-    return 0
 
 
 _EDGE_CACHE = {}
@@ -2480,8 +1745,8 @@ def run_wayland_feed(path, seconds, hz, smooth, W, H, out_x, debug=False,
     """Feed ARGB frames to the native Wayland layer-shell presenter.
 
     KWin blends the alpha channel of a layer-shell surface, so this is the
-    only path that yields real per-pixel transparency here: XWayland refuses
-    depth-32 windows and shape-clipped X11 windows stay opaque black.
+    only path that yields real per-pixel transparency: the compositor owns
+    the surface, and only dirty rectangles travel over the pipe.
     """
     if not os.path.exists(PRESENTER):
         print(f"missing presenter binary: {PRESENTER}")
@@ -2633,17 +1898,15 @@ def run_wayland_feed(path, seconds, hz, smooth, W, H, out_x, debug=False,
 
 
 def main():
-    p = argparse.ArgumentParser(description="SPT quest marker overlay (X11 + SHAPE)")
+    p = argparse.ArgumentParser(
+        description="SPT quest marker overlay (Wayland layer-shell presenter)")
     p.add_argument("--config", default=None,
                    help="JSON defaults (default: config.json next to overlay.py, "
                         "NOT next to the launch directory); explicit CLI flags override them")
-    p.add_argument("--display", default=None)
-    p.add_argument("--test", action="store_true")
     p.add_argument("--feed", default=None)
     p.add_argument("--seconds", type=float, default=None)
     p.add_argument("--hz", type=float, default=None)
     p.add_argument("--geometry", default=None)
-    p.add_argument("--readback", action="store_true")
     p.add_argument("--debug", action="store_true",
                    help="Log feed stats (rects, feed age, rate) to stderr every 2 s.")
     p.add_argument("--trace", default=None, metavar="JSONL",
@@ -2658,16 +1921,9 @@ def main():
                    help="Allow a ws:// feed WITHOUT a feed token (no challenge - "
                         "any local process could inject frames). Only for testing "
                         "against a plugin whose Feed Token is empty.")
-    p.add_argument("--keep", action="store_true")
     p.add_argument("--smooth", type=float, default=None,
                    help="EMA smoothing time constant in seconds "
                         "(0 = off, larger = smoother, no steady-state lag)")
-    p.add_argument("--argb", dest="argb", action="store_true", default=None,
-                   help="depth-32 ARGB window (per-pixel alpha, default in feed mode)")
-    p.add_argument("--no-argb", dest="argb", action="store_false",
-                   help="force the depth-24 Shape-clip path")
-    p.add_argument("--presenter", choices=("wayland", "x11"), default=None,
-                   help="wayland layer-shell (default, real alpha) or x11 window")
     args = p.parse_args()
     # config.json supplies defaults; explicit CLI flags win over it. The
     # default path is anchored to overlay.py's OWN directory (launch CWD
@@ -2682,7 +1938,6 @@ def main():
     if not isinstance(cfg, dict):
         print(f"config: {_CONFIG_PATH} is not a JSON object - using built-in defaults")
         cfg = {}
-    args.display = args.display if args.display is not None else cfg.get("display")
     args.geometry = args.geometry if args.geometry is not None else cfg.get("geometry")
     args.feed = args.feed if args.feed is not None else cfg.get("feed")
     args.seconds = _finite(args.seconds if args.seconds is not None else cfg.get("seconds", 0.0), 0.0)
@@ -2693,12 +1948,6 @@ def main():
         hz_val = clamped
     args.hz = hz_val
     args.smooth = _finite(args.smooth if args.smooth is not None else cfg.get("smooth", 0.6), 0.6)
-    args.readback = _flag(args.readback, False) or _flag(cfg.get("readback", False), False)
-    use_argb = _flag(cfg.get("argb", True), True) if args.argb is None else args.argb
-    args.presenter = args.presenter if args.presenter is not None else cfg.get("presenter", "wayland")
-    if args.presenter not in ("wayland", "x11"):
-        print(f"presenter {args.presenter!r} is not 'wayland' or 'x11' - using wayland")
-        args.presenter = "wayland"
     args.feed_token = args.feed_token if args.feed_token is not None else cfg.get("feedToken", "")
     if args.feed and args.feed.startswith("file://"):
         args.feed = args.feed[len("file://"):]  # accepted scheme == plain path
@@ -2726,73 +1975,19 @@ def main():
     else:
         FONT = FEATURE_DEFAULTS["font"]
 
-    if args.feed and not args.test:
-        sys.stdout = _Tee(sys.stdout, LOG_PATH)
-
-    if args.presenter == "wayland" and not args.test:
-        if not args.feed:
-            print("nothing to do (use --test or --feed)")
-            return 2
-        if args.geometry:
-            W, H, X, Y = parse_geometry(args.geometry)
-        else:
-            W, H, X, Y = 2560, 1440, 0, 0  # primary display, fullscreen (single-monitor default)
-        print(f"presenter: wayland layer-shell {W}x{H}, output x={X}")
-        return run_wayland_feed(args.feed, args.seconds, args.hz, args.smooth,
-                                W, H, X, debug=args.debug, trace=args.trace,
-                                feed_token=args.feed_token)
-
-    xd = _open_display(args.display.encode() if args.display else None)
-    if not xd:
-        sys.exit("cannot open X display")
-    visual = _default_visual(xd, 0)
-    depth = _default_depth(xd, 0)
-    if use_argb and not args.test:
-        avis, adep = find_argb_visual(xd, 0)
-        if avis and not argb_probe_ok(xd, avis, adep):
-            print("window: depth-32 visual advertised but this server refuses depth-32 windows"
-                  " (Xwayland behaviour) -> depth-24 Shape clip fallback;")
-            print("        for true per-pixel alpha on Wayland use the default wayland presenter.")
-            avis = None
-        if avis:
-            visual, depth = avis, adep
-            print("window: depth-32 ARGB visual (per-pixel alpha)")
-        else:
-            print("window: no depth-32 visual -> depth-24 Shape clip fallback")
+    if not args.feed:
+        print("nothing to do (use --feed)")
+        return 2
+    sys.stdout = _Tee(sys.stdout, LOG_PATH)
 
     if args.geometry:
-        W, H, X, Y = parse_geometry(args.geometry)
+        W, H, X, _ = parse_geometry(args.geometry)
     else:
-        W, H = _display_width(xd, 0), _display_height(xd, 0)
-        X, Y = 0, 0
-
-    win = create_window(xd, W, H, X, Y, visual, depth)
-    gc = _create_gc(xd, win, 0, None)
-    map_and_raise(xd, win)  # XGetImage on an UNMAPPED window is BadMatch
-
-    rc = 0
-    try:
-        if args.test:
-            rc = run_test(xd, win, gc, visual, depth, W, H, X, Y)
-        elif args.feed:
-            canvas = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H) if depth == 32 else None
-            rc = run_feed(xd, win, gc, visual, depth, args.feed,
-                          args.seconds, args.hz, args.readback, args.smooth,
-                          canvas=canvas, debug=args.debug, trace=args.trace,
-                          feed_token=args.feed_token)
-        else:
-            print("nothing to do (use --test or --feed)")
-            rc = 2
-    finally:
-        # A crash inside a feed frame must not leave an invisible full-screen
-        # override window (X11) mapped on the desktop.
-        if not args.keep:
-            _unmap_window(xd, win)
-            _destroy_window(xd, win)
-            _sync(xd, 0)
-            _close_display(xd)
-    return rc
-
+        W, H, X, _ = 2560, 1440, 0, 0  # primary display, fullscreen (single-monitor default)
+    print(f"presenter: wayland layer-shell {W}x{H}, output x={X}")
+    return run_wayland_feed(args.feed, args.seconds, args.hz, args.smooth,
+                            W, H, X, debug=args.debug, trace=args.trace,
+                            feed_token=args.feed_token)
 
 if __name__ == "__main__":
     try:

@@ -26,7 +26,7 @@ gives you the quest-marker HUD you know from mods on Windows:
 - a **small Python program** (`overlay.py`) draws them as pins with labels,
   distances and edge arrows;
 - a **native presenter** puts that drawing on your desktop with real
-  transparency — Wayland layer-shell by default, X11 as a fallback.
+  transparency — a Wayland layer-shell surface the compositor blends for you.
 
 It is a port inspired by **maschine's QuestMarkers** (MIT). Same look, same
 idea, rebuilt for Linux.
@@ -81,8 +81,9 @@ bash wayland/build.sh
 cp config.example.json config.json
 openssl rand -hex 16          # paste the output as "feedToken" in config.json
 
-# 4) sanity check: runs the built-in self-test, no game needed
-.venv/bin/python3 overlay.py --test
+# 4) sanity check: demo markers on your desktop for 5 s, no game and no plugin
+.venv/bin/python3 feed_sim.py &
+.venv/bin/python3 overlay.py --feed logs/latest.json --seconds 5
 ```
 
 **5) Install the plugin into SPT**
@@ -196,7 +197,6 @@ repository on purpose — it carries your feed token.
   "feed": "ws://127.0.0.1:9378",
   "hz": 120,
   "smooth": 0.045,
-  "presenter": "wayland",
   "labels": true,
   "distance": true,
   "edge": true,
@@ -215,19 +215,17 @@ repository on purpose — it carries your feed token.
 | `feed` | `ws://127.0.0.1:9378` | feed source: `ws://…` or a `latest.json` path |
 | `hz` | 120 | **render** rate; the plugin's data rate is `Feed Hz` |
 | `smooth` | 0.045 s | seam blending of the motion interpolator (0 = raw) |
-| `presenter` | `wayland` | `wayland` (layer-shell, real alpha) or `x11` |
 | `labels`, `distance`, `edge` | true | mirrors the plugin display options |
 | `scale`, `farDistance`, `farScale`, `iconScale` | 1.0 / 300 / 0.6 / 1.0 | sizes |
 | `edgeSize` | 24 | edge arrow size in px |
 | `imperial` | false | feet/miles |
-| `readback` | false | keep the pixel-readback verification |
-| `display`, `geometry` | null | force a monitor / geometry |
+| `geometry` | null | override the surface placement |
 | `feedToken` | — | shared secret, must equal the plugin's `Feed Token` |
 
 The file is read once at overlay start. A UTF-8 BOM is fine; a broken file
 prints one warning and the overlay continues with defaults. Booleans are
 strict (`"labels": "no"` really means off), unknown keys are ignored, `hz` is
-clamped to 1–300, and `presenter` only accepts `wayland` or `x11`.
+clamped to 1–300.
 
 **Font:** labels use *Chakra Petch* if fontconfig finds it, otherwise your
 system font. Install it (Arch: AUR `ttf-chakra-petch`; elsewhere:
@@ -240,15 +238,12 @@ purpose.
 |---|---|
 | `--feed URL_OR_FILE` | feed source |
 | `--config PATH` | alternate config file |
+| `--geometry WxH+X+Y` | surface placement (default fullscreen at 0,0) |
 | `--hz N` | render rate |
 | `--smooth S` | seam blending |
-| `--presenter wayland\|x11` | force a presenter |
-| `--display NAME`, `--geometry WxH+X+Y` | pick screen / placement |
-| `--test` | self-test suite, no game needed |
 | `--debug` | per-frame feed stats every 2 s |
 | `--trace FILE.jsonl` | log every incoming frame (capped at 64 MiB) |
-| `--readback` | verify what actually reached the screen |
-| `--keep`, `--seconds N`, `--argb/--no-argb` | dev/debug helpers |
+| `--seconds N` | stop after N seconds (default: run until Ctrl-C) |
 | `--feed-token T` | token override (prefer `config.json`) |
 | `--insecure` | allow a `ws://` feed with no token (dev only) |
 
@@ -310,7 +305,7 @@ placeholder `config.example.json` is tracked.
 | `server could NOT prove knowledge of the feed token` | something else owns port 9378, or the token differs | close the squatter / align the tokens |
 | `refusing an unauthenticated ws:// feed` | no token, no `--insecure` | set a token (recommended) or pass `--insecure` for dev |
 | Markers misplaced after a resolution change | surface size changed | handled live via `presenter: configured WxH`; on a **rotated** screen markers are clipped by design (one honest warning is printed) |
-| `presenter keeps dying - giving up` | compositor refused the surface (often XWayland or an unsupported protocol) | try `--presenter x11`, check the log line before the deaths |
+| `presenter keeps dying - giving up` | the compositor refused the layer-shell surface (unsupported protocol, or not a Wayland session) | read the log line right before the deaths; the overlay needs a Wayland session, not XWayland |
 | Labels in a boring font | Chakra Petch not installed | install it or set `"font": ""` |
 | Markers freeze on screen | feed went quiet > 1 s | expected: the overlay clears itself; check the game/plugin log |
 | Feed works, markers jitter | very low game FPS | the smoother interpolates real measurements; lower `hz` rarely helps, see [Under the hood](#under-the-hood) |
@@ -326,7 +321,7 @@ Three parts, one direction of data flow:
 
 ```
 SPT + BepInEx plugin  ──ws://127.0.0.1:9378──▶  overlay.py  ──shared memory──▶  presenter
-   (Wine process)                                (Linux)                        (Wayland/X11)
+   (Wine process)                                (Linux)                         (Wayland)
 ```
 
 **The plugin** (`plugin/src/`) scans quest targets, extract points, airdrops and
@@ -344,7 +339,7 @@ sends dirty rects to the presenter. Feed frames older than **1 second** clear
 the display.
 
 **The presenter** (`wayland/wayland_present.c`) is a tiny C program: a
-layer-shell surface with per-pixel alpha on Wayland, a shaped window on X11. It
+layer-shell surface with per-pixel alpha that the compositor blends. It
 copies rects with `memcpy`, bounds each rect to one full surface and a full
 frame to 2× that, and exits fail-closed on a desynced header instead of
 guessing. If it dies, the overlay respawns it (5 tries per death, at most 50
@@ -396,7 +391,6 @@ Everything is a plain script with a `RESULT:` line — no pytest, no fixtures:
 .venv/bin/python3 tests/test_feed_hardening.py   # sanitizer, caps, log masking
 .venv/bin/python3 tests/test_frame_rects.py      # geometry
 .venv/bin/python3 tests/test_smooth.py           # interpolation
-.venv/bin/python3 overlay.py --test              # built-in self-test
 ```
 
 `tests/test_plugin_ws.py` is the interesting one: it compiles the production
@@ -439,9 +433,11 @@ Yes. One script, autostart it once and forget it.
 **Can the plugin start the overlay itself?**
 No — the plugin lives inside the Wine process and cannot launch Linux programs.
 
-**Does this work on X11?**
-Yes, `--presenter x11`. Wayland layer-shell is the default and has true
-per-pixel alpha.
+**Does this work on X11 / XWayland?**
+No, and deliberately so: the overlay is a Wayland layer-shell client. Under
+XWayland a depth-32 window is refused and a depth-24 window cannot carry
+alpha, which is exactly the black screen X11 users hit. Use a Wayland
+session (KDE, GNOME and wlroots compositors all work).
 
 **SPT just updated — will the mod break?**
 A game update can change the classes the plugin reads. Rebuild the plugin

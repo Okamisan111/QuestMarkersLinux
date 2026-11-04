@@ -19,7 +19,7 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
 {
     public const string PluginGuid = "com.chaossan.questmarkerslinux";
     public const string PluginName = "QuestMarkersLinux";
-    public const string PluginVersion = "1.1.1";
+    public const string PluginVersion = "1.2.0";
 
     private ConfigEntry<bool> bridgeOn;
     private ConfigEntry<KeyboardShortcut> toggleKey;
