@@ -8,9 +8,13 @@ A transparent overlay that shows where your quest objectives, extracts, airdrops
 and BTRs are, with a pin, a distance and an arrow at the screen edge when the
 target is off-screen or behind you.
 
+> **Requires a Wayland session.** The overlay is a native layer-shell client, so
+> it draws nothing on X11 or XWayland — there you get a black screen instead of
+> markers. KDE Plasma, GNOME and wlroots compositors all work.
+
 [![CI](https://github.com/Okamisan111/QuestMarkersLinux/actions/workflows/ci.yml/badge.svg)](https://github.com/Okamisan111/QuestMarkersLinux/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Linux%20%2B%20Wine%2FProton-informational)
+![Platform](https://img.shields.io/badge/platform-Linux%20Wayland%20%2B%20Wine%2FProton-informational)
 
 </div>
 
@@ -50,6 +54,7 @@ idea, rebuilt for Linux.
 
 | You need | Why | Check with |
 |---|---|---|
+| A **Wayland session** (KDE Plasma, GNOME, wlroots) | the overlay is a layer-shell client; on X11/XWayland it cannot be drawn at all | `echo $XDG_SESSION_TYPE` prints `wayland` |
 | SPT installed and running under Wine/Proton | the plugin lives inside the game process | you can play SPT |
 | BepInEx 5 in your SPT folder | loads the plugin | `<SPT>/BepInEx/core/BepInEx.dll` exists |
 | Python 3.10+ | runs the overlay | `python3 --version` |
@@ -299,6 +304,7 @@ placeholder `config.example.json` is tracked.
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| Black screen instead of markers | you are on X11 / XWayland | log in to a Wayland session — this is a layer-shell overlay and cannot draw on X11 |
 | Nothing appears, ever | overlay not running | start `overlay.py`, check `pgrep -f overlay.py` |
 | Keys do nothing | you pressed **I** without an overlay | the key only toggles what the overlay draws |
 | `ws feed: ... (retry in 2 s)` forever | token mismatch or old plugin | same token on both sides, restart **game first**, then overlay |
