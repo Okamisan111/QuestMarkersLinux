@@ -1,0 +1,20 @@
+{
+  "feed": "ws://127.0.0.1:9378",
+  "hz": 120,
+  "seconds": 0,
+  "smooth": 0.045,
+  "readback": false,
+  "display": null,
+  "geometry": null,
+  "presenter": "wayland",
+  "labels": true,
+  "distance": true,
+  "edge": true,
+  "scale": 1.0,
+  "farDistance": 300.0,
+  "farScale": 0.6,
+  "imperial": false,
+  "edgeSize": 24,
+  "iconScale": 1.0,
+  "feedToken": "CHANGE-ME-generate-your-own"
+}

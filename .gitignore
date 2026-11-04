@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+logs/
+logs_cdp*/
+tests/_results/
+tests/_artifacts/
+presenter
+aio
+*.log
+wayland/wayland_present_asan
+
+# local secrets & machine-specific settings (config.example.json is the tracked template)
+config.json
+# dotnet build intermediates
+plugin/obj/
+
+# private reference material (decompiled upstream etc.) - never publish
+.ref/
+QA_REPORT*.md
+plugin/Directory.Build.props
