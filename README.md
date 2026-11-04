@@ -1,6 +1,6 @@
 # QuestMarkersLinux
 
-System-wide quest-marker overlay for **SPT (Single Player Tarkov)** on
+System-wide quest-marker overlay for **SPT (Single Player Tushonka)** on
 Linux/Wine/Proton: a transparent on-screen HUD showing quest targets,
 extracts, airdrops and BTR trains **outside** the game window — heavily
 inspired by maschine's [QuestMarkers](https://sp-mod.com/mod/2954/quest-marker)
