@@ -50,7 +50,6 @@ ones as pins with name and distance.*
 
 ### What it is not
 
-- Not a cheat for live SPT. SPT is offline, single-player only.
 - Not affiliated with Battlestate Games or the SPT team.
 
 ---
