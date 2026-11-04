@@ -32,7 +32,7 @@ gives you the quest-marker HUD you know from mods on Windows:
 - a **native presenter** puts that drawing on your desktop with real
   transparency — a Wayland layer-shell surface the compositor blends for you.
 
-It is a port inspired by **maschine's QuestMarkers** (MIT). Same look, same
+It is a port inspired by **maschine's QuestMarkers** (MIT). Similar look, same
 idea, rebuilt for Linux.
 
 ![Quest markers in a raid: pins with quest names and distances, plus edge arrows for off-screen targets](docs/example.webp)
