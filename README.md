@@ -18,7 +18,7 @@ target is off-screen or behind you.
 
 ## What this is
 
-SPT (Single Player Tarkov) runs on Linux through Wine or Proton. This project
+SPT (Single Player Tushonka) runs on Linux through Wine or Proton. This project
 gives you the quest-marker HUD you know from mods on Windows:
 
 - a **BepInEx plugin** inside the game reads your active quest targets,
@@ -41,9 +41,7 @@ idea, rebuilt for Linux.
 
 ### What it is not
 
-- Not a cheat for live Tarkov — SPT is offline, single-player only.
-- Not a wallhack: it shows quest markers (the same information the game gives
-  you), never player or bot positions.
+- Not a cheat for live SPT. SPT is offline, single-player only.
 - Not affiliated with Battlestate Games or the SPT team.
 
 ---
