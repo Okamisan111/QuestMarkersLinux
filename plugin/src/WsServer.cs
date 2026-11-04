@@ -10,7 +10,22 @@ using System.Threading;
 namespace QuestMarkersLinux;
 
 /// Minimal RFC6455 WebSocket server for the native overlay feed.
-/// Single client; new connections replace the old one. Text frames only.
+/// Text frames only; one client slot.
+///
+/// Feed authentication (protocol v3): the shared token is NEVER sent - not in
+/// the URL, not in a header, not per frame in the clear. After the 101 upgrade
+/// the server sends a challenge text frame
+///   {"c":"chal","n":"<server nonce hex>","p":"<HMAC-SHA256(key=token, msg=n) hex>"}
+/// The overlay verifies p with the shared token (proving the SERVER - a local
+/// process squatting the port cannot forge it) and answers within 8 s with
+///   {"c":"auth","r":"<HMAC-SHA256(key=token, msg=n) hex>"}
+/// (proving the CLIENT). Both compares are constant time. Only an
+/// authenticated client ever occupies the client slot - takeover by a new
+/// connection happens strictly after its challenge succeeds, and a client
+/// that merely connects without replying holds nothing (8 s auth deadline,
+/// 60 s idle timeout afterwards; every client runs on its own thread so the
+/// accept loop is never stalled). An empty Feed Token disables the challenge
+/// entirely - the plugin logs this loudly.
 internal sealed class WsServer : IDisposable
 {
     private readonly int port;
@@ -54,7 +69,7 @@ internal sealed class WsServer : IDisposable
     {
         while (true)
         {
-            TcpClient tcp = null;
+            TcpClient tcp;
             try
             {
                 tcp = listener.AcceptTcpClient();
@@ -63,15 +78,27 @@ internal sealed class WsServer : IDisposable
             {
                 return; // listener disposed
             }
-            try
+            // Each client on its own thread: a client that connects and stays
+            // silent can never stall the accept loop (previously HandleClient
+            // ran inline and ate the single slot - exactly the documented
+            // takeover path was unreachable).
+            Thread t = new Thread(() =>
             {
-                HandleClient(tcp);
-            }
-            catch (Exception ex)
-            {
-                log("WebSocket client handshake failed: " + ex.Message);
-            }
-            tcp?.Close();
+                try
+                {
+                    HandleClient(tcp);
+                }
+                catch (Exception ex)
+                {
+                    log("WebSocket client failed: " + ex.Message);
+                }
+                finally
+                {
+                    try { tcp.Close(); } catch { }
+                }
+            })
+            { IsBackground = true, Name = "QuestMarkersLinux-client" };
+            t.Start();
         }
     }
 
@@ -83,28 +110,30 @@ internal sealed class WsServer : IDisposable
         // game) until the OS buffer gives up; 1 s bounds the stall and the
         // existing catch drops the client instead.
         tcp.SendTimeout = 1000;
-        // The accept loop calls HandleClient inline: a client that connects
-        // but never sends the upgrade request would stall the loop forever
-        // (no new overlay could ever connect). Bound the pre-upgrade reads;
-        // after the handshake the read loop is intentionally unbounded.
         tcp.ReceiveTimeout = 10000;
         NetworkStream stream = tcp.GetStream();
-        // Read the HTTP upgrade request line-by-line.
+        // Whole-handshake deadline: ReceiveTimeout bounds a single read, so
+        // a slow-loris drip (one byte every 9 s) would still crawl forever.
+        DateTime deadline = DateTime.UtcNow.AddSeconds(12);
         var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         int ch;
         var lineBuf = new StringBuilder();
         bool first = true;
-        string requestLine = "";
         int headerBytes = 0;
         while ((ch = stream.ReadByte()) != -1)
         {
+            if (DateTime.UtcNow > deadline)
+            {
+                log("WebSocket handshake dropped: slow (dripping) handshake.");
+                return;
+            }
             if (ch == '\r') continue;
             if (ch == '\n')
             {
                 string line = lineBuf.ToString();
                 lineBuf.Clear();
                 if (line.Length == 0) break;
-                if (first) { first = false; requestLine = line; continue; }
+                if (first) { first = false; continue; }
                 int sep = line.IndexOf(':');
                 if (sep > 0) headers[line.Substring(0, sep).Trim()] = line.Substring(sep + 1).Trim();
                 continue;
@@ -134,39 +163,53 @@ internal sealed class WsServer : IDisposable
             catch { }
             return;
         }
-        if (!string.IsNullOrEmpty(token))
-        {
-            string given = QueryToken(requestLine);
-            if (given == null || !ConstantTimeEquals(given, token))
-            {
-                log("WebSocket handshake rejected: missing/wrong feed token " +
-                    "(overlay must connect ws://127.0.0.1:" + port + "/?token=<Feed Token>).");
-                try
-                {
-                    byte[] deny = Encoding.ASCII.GetBytes("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
-                    stream.Write(deny, 0, deny.Length);
-                }
-                catch { }
-                return;
-            }
-        }
         if (!headers.TryGetValue("Sec-WebSocket-Key", out string key)) return;
         string accept = ComputeAccept(key);
         byte[] resp = Encoding.ASCII.GetBytes("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n");
         stream.Write(resp, 0, resp.Length);
-        // Post-upgrade: wait for frames/pings indefinitely. .NET forbids
-        // ReadTimeout = 0 - the sentinel for "no timeout" is Timeout.Infinite.
-        stream.ReadTimeout = System.Threading.Timeout.Infinite;
 
-        NetworkStream prev;
+        // ---- feed authentication (v3 challenge/response) ----
+        bool authenticated = string.IsNullOrEmpty(token);
+        if (!string.IsNullOrEmpty(token))
+        {
+            byte[] nonceBuf = new byte[16];
+            using (RandomNumberGenerator rng = RandomNumberGenerator.Create()) rng.GetBytes(nonceBuf);
+            string nonce = Hex(nonceBuf);
+            string proof = HmacHex(token, nonce);
+            SendText(stream, "{\"c\":\"chal\",\"n\":\"" + nonce + "\",\"p\":\"" + proof + "\"}");
+            stream.ReadTimeout = 8000; // the overlay answers in milliseconds
+            string reply = ReadClientTextFrame(stream, 4096);
+            string answer = ExtractJsonField(reply, "r");
+            if (answer == null || !ConstantTimeEquals(answer, proof))
+            {
+                log("Feed client refused: challenge response missing or wrong - " +
+                    "is the overlay's config.json feedToken the same value as the " +
+                    "plugin's Feed Token? (or is some other process connecting?)");
+                try { CloseWithCode(stream, 1008); } catch { }
+                return; // never touches the current client slot
+            }
+            authenticated = true;
+        }
+
+        // .NET forbids ReadTimeout = 0 - timeouts here are plain millisecond values.
+        // Idle: the overlay's websocket keepalive pings arrive every ~20 s; a
+        // client that falls silent for 60 s is dropped and the slot frees up.
+        stream.ReadTimeout = 60000;
+
         lock (sendLock)
         {
-            prev = client;
+            NetworkStream prev = client;
             client = stream;
             droppedFrames = 0;
+            if (prev != null)
+            {
+                try { prev.Close(); } catch { }
+                log("Overlay client replaced (takeover by the newest client).");
+            }
         }
-        if (prev != null) log("Overlay client replaced (new connection).");
-        log("Overlay client connected.");
+        log(authenticated
+            ? "Overlay client connected: feed token verified via challenge."
+            : "Overlay client connected WITHOUT feed token (Feed Token is empty - any local process may read the feed).");
 
         // Read loop: consume frames so the client can keep sending; react to close/ping.
         try
@@ -177,31 +220,42 @@ internal sealed class WsServer : IDisposable
                 int b1 = stream.ReadByte();
                 if (b0 < 0 || b1 < 0) break;
                 int op = b0 & 0x0F;
+                bool masked = (b1 & 0x80) != 0;
                 long len = b1 & 0x7F;
                 if (len == 126)
                 {
-                    len = (stream.ReadByte() << 8) | stream.ReadByte();
+                    byte[] ext = new byte[2];
+                    ReadFull(stream, ext, 2);
+                    len = (ext[0] << 8) | ext[1];
                 }
                 else if (len == 127)
                 {
+                    byte[] ext = new byte[8];
+                    ReadFull(stream, ext, 8);
                     len = 0;
-                    for (int i = 0; i < 8; i++) len = (len << 8) | stream.ReadByte();
+                    for (int i = 0; i < 8; i++) len = (len << 8) | ext[i];
                 }
-                byte[] mask = new byte[4];
-                ReadFull(stream, mask, 4);
+                if (op >= 0x8 && len > 125) break; // control frames are <=125 bytes (RFC6455 5.5)
+                byte[] mask = null;
+                if (masked)
+                {
+                    mask = new byte[4];
+                    ReadFull(stream, mask, 4);
+                }
                 byte[] payload = null;
-                if (len > 0 && len < 1 << 20)
+                if (len > 0 && len < (1 << 20))
                 {
                     payload = new byte[(int)len];
                     ReadFull(stream, payload, (int)len);
-                    for (int i = 0; i < payload.Length; i++) payload[i] ^= mask[i & 3];
+                    if (mask != null)
+                        for (int i = 0; i < payload.Length; i++) payload[i] ^= mask[i & 3];
                 }
-                else if (len > 0) break;
+                else if (len > 0) break; // client payload over 1 MiB: hostile
                 if (op == 0x8) break; // close
                 if (op == 0x9) Pong(stream, payload);
             }
         }
-        catch { }
+        catch { } // idle timeout, socket death, protocol garbage
         lock (sendLock)
         {
             if (client == stream) client = null;
@@ -270,6 +324,72 @@ internal sealed class WsServer : IDisposable
         }
     }
 
+    private static void SendText(NetworkStream stream, string text)
+    {
+        byte[] payload = Encoding.UTF8.GetBytes(text);
+        byte[] header = BuildFrame(payload.Length);
+        stream.Write(header, 0, header.Length);
+        stream.Write(payload, 0, payload.Length);
+    }
+
+    /// Read one masked client frame; return its text payload, or null on
+    /// timeout/close/non-text (the caller treats null as refused authentication).
+    private static string ReadClientTextFrame(NetworkStream stream, int maxLen)
+    {
+        try
+        {
+            int b0 = stream.ReadByte();
+            int b1 = stream.ReadByte();
+            if (b0 < 0 || b1 < 0) return null;
+            if ((b0 & 0x0F) != 0x1) return null;            // must be a text frame
+            if ((b0 & 0x80) == 0) return null;              // client frames MUST be masked (RFC6455 5.1)
+            long len = b1 & 0x7F;
+            if (len == 126)
+            {
+                byte[] ext = new byte[2];
+                ReadFull(stream, ext, 2);
+                len = (ext[0] << 8) | ext[1];
+            }
+            else if (len == 127) return null;
+            if (len <= 0 || len > maxLen) return null;
+            byte[] mask = new byte[4];
+            ReadFull(stream, mask, 4);
+            byte[] payload = new byte[(int)len];
+            ReadFull(stream, payload, (int)len);
+            for (int i = 0; i < payload.Length; i++) payload[i] ^= mask[i & 3];
+            return Encoding.UTF8.GetString(payload);
+        }
+        catch
+        {
+            return null; // timeout (8 s), early close, malformed framing
+        }
+    }
+
+    /// Extracts a flat string field from the tiny auth reply object
+    /// {"c":"auth","r":"<hex>"} - no JSON parser dependency in the plugin.
+    /// Tolerates whitespace styles (json.dumps default emits `"r": "..."` with
+    /// a space, compact clients emit `"r":"..."`).
+    private static string ExtractJsonField(string json, string field)
+    {
+        if (json == null) return null;
+        int at = json.IndexOf("\"" + field + "\"", StringComparison.Ordinal);
+        if (at < 0) return null;
+        int colon = json.IndexOf(':', at + field.Length + 2);
+        if (colon < 0) return null;
+        int quote = json.IndexOf('"', colon + 1);
+        if (quote < 0) return null;
+        int end = json.IndexOf('"', quote + 1);
+        if (end <= quote + 1) return null;
+        return json.Substring(quote + 1, end - quote - 1);
+    }
+
+    private static void CloseWithCode(NetworkStream stream, ushort code)
+    {
+        byte[] body = { (byte)(code >> 8), (byte)code };
+        stream.Write(new byte[] { 0x88, 2 }, 0, 2);
+        stream.Write(body, 0, 2);
+    }
+
     private static byte[] BuildFrame(int len)
     {
         var h = new List<byte>();
@@ -295,22 +415,17 @@ internal sealed class WsServer : IDisposable
             return Convert.ToBase64String(sha.ComputeHash(Encoding.ASCII.GetBytes(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
     }
 
-    private static string QueryToken(string requestLine)
+    private static string HmacHex(string key, string message)
     {
-        if (string.IsNullOrEmpty(requestLine)) return null;
-        string[] parts = requestLine.Split(' ');
-        if (parts.Length < 2) return null;
-        string path = parts[1];
-        int q = path.IndexOf('?');
-        if (q < 0) return null;
-        foreach (string pair in path.Substring(q + 1).Split('&'))
-        {
-            int eq = pair.IndexOf('=');
-            if (eq <= 0) continue;
-            if (pair.Substring(0, eq) == "token")
-                return Uri.UnescapeDataString(pair.Substring(eq + 1));
-        }
-        return null;
+        using (var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(key)))
+            return Hex(hmac.ComputeHash(Encoding.UTF8.GetBytes(message)));
+    }
+
+    private static string Hex(byte[] bytes)
+    {
+        var sb = new StringBuilder(bytes.Length * 2);
+        foreach (byte b in bytes) sb.Append(b.ToString("x2"));
+        return sb.ToString();
     }
 
     private static bool ConstantTimeEquals(string a, string b)

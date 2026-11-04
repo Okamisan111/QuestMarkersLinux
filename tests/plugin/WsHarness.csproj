@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Test harness: compiles the PRODUCTION WsServer.cs unchanged (no Unity,
+       no BepInEx, no game DLLs) so the feed WebSocket protocol can be proven
+       in CI where the plugin DLL itself is not buildable. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <AssemblyName>ws-harness</AssemblyName>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../plugin/src/WsServer.cs" />
+    <Compile Include="Harness.cs" />
+  </ItemGroup>
+</Project>

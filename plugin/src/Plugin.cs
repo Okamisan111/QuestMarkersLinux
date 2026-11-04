@@ -19,7 +19,7 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
 {
     public const string PluginGuid = "com.chaossan.questmarkerslinux";
     public const string PluginName = "QuestMarkersLinux";
-    public const string PluginVersion = "1.0.0";
+    public const string PluginVersion = "1.1.0";
 
     private ConfigEntry<bool> bridgeOn;
     private ConfigEntry<KeyboardShortcut> toggleKey;
@@ -46,6 +46,8 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
 
     private BridgeScanner scanner;
     private WsServer server;
+    private string activeFeedToken = "";
+    private int activePort;
     private bool lastInRaid;
     private bool peeking;
     private bool secondKeyPeek;
@@ -76,7 +78,7 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
         port = Config.Bind("General", "Feed Port", 9378,
             Tagged("Feed Port", 5, "WebSocket port the quest-overlay presenter connects to (loopback only). Only for non-standard setups.", null, true));
         feedToken = Config.Bind("General", "Feed Token", "",
-            Tagged("Feed Token", 3, "Shared secret for the overlay feed: the overlay must connect with ?token=<value> and every frame carries the token back; frames with a wrong token are dropped by the overlay. Empty disables the token check (handshakes carrying a browser Origin header stay rejected either way). Changing the token only takes effect with the game closed: the plugin reads it at game start, the overlay reads its config.json at overlay start - set both sides to the same value, then start the game first, then the overlay.", null, true));
+            Tagged("Feed Token", 3, "Shared secret for the overlay feed. It is NEVER sent over the network: the server first proves itself to the overlay (challenge HMAC over a fresh nonce), then the overlay proves itself back within 8 s; wrong or missing answers are rejected without ever opening the client slot. Frames additionally carry a token stamp the overlay verifies (frame-level integrity). Empty = unauthenticated feed (any local process can read live raid positions; browser-Origin handshakes stay rejected either way). Changing the token only takes effect with the game closed: the plugin reads it at game start, the overlay reads its config.json at overlay start - set both sides to the same value, then start the game first, then the overlay.", null, true));
         feedHz = Config.Bind("General", "Feed Hz", 60f,
             Tagged("Feed Hz", 4, "Frames per second pushed to the overlay (1-180, game-frame-aligned sampling). Higher is smoother near quest targets - their screen speed scales with 1/distance; values above your game FPS add nothing.", null, true));
         maxDistance = Config.Bind("Filter", "Maximum Distance", 0f,
@@ -117,7 +119,16 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
         scanner = new BridgeScanner(
             msg => { if (debugLog.Value) Logger.LogInfo("[scan] " + msg); else Logger.LogDebug(msg); },
             msg => Logger.LogWarning(msg));
-        server = new WsServer(port.Value, feedToken.Value, msg => Logger.LogInfo(msg));
+        // Single source of truth: Feed Token and Feed Port are captured once at
+        // startup. The WS server authenticates against exactly this snapshot and
+        // every frame's tok stamp comes from the same one - a live edit of the
+        // config mid-raid can no longer make the server authenticate with one
+        // value while the frames carry another (which is how a mid-raid token
+        // change silently broke the feed). The snapshot is the reason a token
+        // change only takes effect on the next game start.
+        activeFeedToken = feedToken.Value ?? "";
+        activePort = port.Value;
+        server = new WsServer(activePort, activeFeedToken, msg => Logger.LogInfo(msg));
         try
         {
             server.Start();
@@ -126,7 +137,7 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
         {
             Logger.LogError("Feed server could not start: " + ex.Message);
         }
-        Logger.LogInfo(PluginName + " loaded; overlay connects to ws://127.0.0.1:" + port.Value);
+        Logger.LogInfo(PluginName + " loaded; overlay connects to ws://127.0.0.1:" + activePort);
         if (string.IsNullOrEmpty(feedToken.Value))
             Logger.LogWarning("Feed Token is empty: the feed accepts ANY local process " +
                 "(live raid positions can be read by anything on this machine). Set a Feed " +
@@ -209,8 +220,8 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
             else if (inRaid && ++noClientWarn >= (int)Math.Max(1, (int)feedHz.Value) * 10)
             {
                 noClientWarn = 0;
-                Logger.LogInfo("[notice] no overlay client on ws://127.0.0.1:" + port.Value +
-                    " - start it before/during the raid: python3 overlay.py --feed ws://127.0.0.1:" + port.Value);
+                Logger.LogInfo("[notice] no overlay client on ws://127.0.0.1:" + activePort +
+                    " - start it before/during the raid: python3 overlay.py --feed ws://127.0.0.1:" + activePort);
             }
         }
     }
@@ -267,6 +278,7 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
         int w = Screen.width;
         int h = Screen.height;
         StringBuilder mJson = new StringBuilder(2048);
+        StringBuilder mFrag = new StringBuilder(160);
         if (camera != null && targets != null)
         {
             Vector3 camPos = camera.transform.position;
@@ -307,11 +319,30 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
             }
             visible.Sort((a, b) => a.dist.CompareTo(b.dist));
             int questCount = 0;
-            int wireBytes = 0;
-            // 8192 sendBuf minus WS header (~14) and the fixed frame
-            // skeleton (t/v/c/cfg/q + quotes ~160 B) minus the tok field.
-            int wireBudget = 8192 - 174
-                - (feedToken.Value != null ? Encoding.UTF8.GetByteCount(feedToken.Value) : 0);
+            // The frame head is built FIRST so the wire budget is measured,
+            // not estimated: every byte the overlay really receives is counted
+            // before a single marker enters the array.
+            sb.Append("{\"t\":").Append(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            sb.Append(",\"v\":[").Append(w).Append(',').Append(h).Append(']');
+            sb.Append(",\"cfg\":{\"labels\":").Append(showLabels.Value ? "true" : "false");
+            sb.Append(",\"distance\":").Append(showDistance.Value ? "true" : "false");
+            sb.Append(",\"edge\":").Append(edgeArrows.Value ? "true" : "false");
+            sb.Append(",\"scale\":").Append(markerScale.Value.ToString("F2", CultureInfo.InvariantCulture));
+            sb.Append(",\"farDistance\":").Append(farDistance.Value.ToString("F1", CultureInfo.InvariantCulture));
+            sb.Append(",\"farScale\":").Append(farScale.Value.ToString("F2", CultureInfo.InvariantCulture));
+            sb.Append(",\"imperial\":").Append(imperialUnits.Value ? "true" : "false");
+            sb.Append(",\"edgeSize\":").Append(edgeArrowSize.Value);
+            sb.Append(",\"iconScale\":").Append(iconScale.Value.ToString("F2", CultureInfo.InvariantCulture));
+            sb.Append('}');
+            sb.Append(",\"tok\":");
+            // Single source: the stamped tok is the exact startup snapshot the
+            // WS server authenticated the overlay against.
+            AppendJsonString(sb, activeFeedToken);
+            // Real-byte budget: WsServer.sendBuf is 8192 and the WS header is
+            // 4 bytes for payloads < 65536; head+tok (measured here) plus the
+            // closing ,"m":[ .. ]} (8 bytes) plus header (4) must stay <= 8192.
+            int wireBytes = Encoding.UTF8.GetByteCount(sb.ToString()) + 12;
+            int wireBudget = 8192 - 4;
             for (int i = 0; i < visible.Count; i++)
             {
                 MarkerTarget t = visible[i].t;
@@ -331,14 +362,29 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
                     ny = 1f - ny;
                 }
                 if (!IsFinite(nx) || !IsFinite(ny)) continue;
-                // Wire budget in BYTES (WsServer.sendBuf is 8192 and a too
-                // large frame would be dropped as a whole): labels can be
-                // multi-byte UTF-8, so measure their real UTF-8 length.
-                // `visible` is distance-ascending -> stopping here keeps the
-                // CLOSEST markers instead of losing the entire frame.
-                int est = 44 + (t.Label != null ? Encoding.UTF8.GetByteCount(t.Label) : 0)
-                            + (t.State != null ? Encoding.UTF8.GetByteCount(t.State) : 0);
-                if (wireBytes + est > wireBudget)
+                // Exact per-marker wire budget: the fragment is rendered into
+                // a scratch builder first and its REAL UTF-8 byte length
+                // (labels can be multi-byte) is committed to the array only if
+                // it still fits. `visible` is distance-ascending -> stopping
+                // here keeps the CLOSEST markers instead of losing the frame.
+                mFrag.Clear();
+                mFrag.Append("{\"k\":\"").Append(t.Kind).Append("\",\"nx\":")
+                    .Append(nx.ToString("F4", CultureInfo.InvariantCulture))
+                    .Append(",\"ny\":").Append(ny.ToString("F4", CultureInfo.InvariantCulture))
+                    .Append(",\"b\":").Append(behind ? 1 : 0)
+                    .Append(",\"op\":1,\"l\":");
+                AppendJsonString(mFrag, t.Label != null && t.Label.Length > 120
+                    ? t.Label.Substring(0, 119) + "\u2026" : t.Label);
+                mFrag.Append(",\"d\":").Append((int)Math.Round(visible[i].dist));
+                if (t.State != null)
+                {
+                    mFrag.Append(",\"s\":");
+                    AppendJsonString(mFrag, t.State);
+                }
+                mFrag.Append('}');
+                int fragBytes = Encoding.UTF8.GetByteCount(mFrag.ToString())
+                                + (mJson.Length > 0 ? 1 : 0);
+                if (wireBytes + fragBytes > wireBudget)
                 {
                     wireDropped++;
                     if (wireDropped % 300 == 1)
@@ -346,38 +392,11 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
                             $"{visible.Count - i} farther targets dropped this frame.");
                     break;
                 }
-                wireBytes += est;
+                wireBytes += fragBytes;
                 if (mJson.Length > 0) mJson.Append(',');
-                mJson.Append("{\"k\":\"").Append(t.Kind).Append("\",\"nx\":")
-                    .Append(nx.ToString("F4", CultureInfo.InvariantCulture))
-                    .Append(",\"ny\":").Append(ny.ToString("F4", CultureInfo.InvariantCulture))
-                    .Append(",\"b\":").Append(behind ? 1 : 0)
-                    .Append(",\"op\":1,\"l\":");
-                AppendJsonString(mJson, t.Label != null && t.Label.Length > 120
-                    ? t.Label.Substring(0, 119) + "\u2026" : t.Label);
-                mJson.Append(",\"d\":").Append((int)Math.Round(visible[i].dist));
-                if (t.State != null)
-                {
-                    mJson.Append(",\"s\":");
-                    AppendJsonString(mJson, t.State);
-                }
-                mJson.Append('}');
+                mJson.Append(mFrag);
             }
         }
-        sb.Append("{\"t\":").Append(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-        sb.Append(",\"v\":[").Append(w).Append(',').Append(h).Append(']');
-        sb.Append(",\"cfg\":{\"labels\":").Append(showLabels.Value ? "true" : "false");
-        sb.Append(",\"distance\":").Append(showDistance.Value ? "true" : "false");
-        sb.Append(",\"edge\":").Append(edgeArrows.Value ? "true" : "false");
-        sb.Append(",\"scale\":").Append(markerScale.Value.ToString("F2", CultureInfo.InvariantCulture));
-        sb.Append(",\"farDistance\":").Append(farDistance.Value.ToString("F1", CultureInfo.InvariantCulture));
-        sb.Append(",\"farScale\":").Append(farScale.Value.ToString("F2", CultureInfo.InvariantCulture));
-        sb.Append(",\"imperial\":").Append(imperialUnits.Value ? "true" : "false");
-        sb.Append(",\"edgeSize\":").Append(edgeArrowSize.Value);
-        sb.Append(",\"iconScale\":").Append(iconScale.Value.ToString("F2", CultureInfo.InvariantCulture));
-        sb.Append('}');
-        sb.Append(",\"tok\":");
-        AppendJsonString(sb, feedToken.Value ?? "");
         sb.Append(",\"m\":[").Append(mJson).Append(']');
         sb.Append('}');
     }

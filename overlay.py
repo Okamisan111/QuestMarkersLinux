@@ -39,6 +39,8 @@ Options:
 
 import argparse
 import ctypes
+import hashlib
+import hmac
 import json
 import re
 import math
@@ -471,6 +473,15 @@ def sanitize_feed(frame):
             mm["s"] = s[:MAX_KEY]
         elif isinstance(s, (int, float)):
             mm["s"] = max(-1e6, min(1e6, _finite(s, 0) or 0))
+        elif "s" in mm:
+            # lists/dicts/objects would land unhashable in the smoothing key
+            # tuple (TypeError in every frame) or render as garbage
+            mm["s"] = None
+        # unclamped scale multipliers would ask for multi-MB cairo surfaces
+        # per marker (DoS) - the cfg path clamps, per-marker sc/ic must too
+        for key in ("sc", "ic"):
+            if key in mm:
+                mm[key] = max(0.1, min(8.0, _finite(mm[key], 1.0)))
         mm["op"] = max(0.0, min(1.0, _finite(mm.get("op"), 1.0)))
         if mm.get("b") is not None:
             b = _finite(mm["b"])
@@ -493,6 +504,13 @@ def sanitize_feed(frame):
                     ee[key] = max(-MAX_PX, min(MAX_PX, val))
             ee["l"] = _clip_label(ee.get("l", ""))
             ee["op"] = max(0.0, min(1.0, _finite(ee.get("op"), 1.0)))
+            # edge geometry comes from an untrusted frame too: w/h/sc without
+            # bounds become absurd surface allocations
+            for key in ("w", "h"):
+                if key in ee:
+                    ee[key] = max(1.0, min(4096.0, _finite(ee[key], 24.0)))
+            if "sc" in ee:
+                ee["sc"] = max(0.1, min(8.0, _finite(ee["sc"], 1.0)))
             clean_e.append(ee)
         out["e"] = clean_e
     else:
@@ -1736,6 +1754,7 @@ def run_feed(xd, win, gc, visual, depth, path, seconds, hz, readback,
     sm_state = {}
     had_feed = False
     miss_since = 0.0
+    x11_errs = [0]
     while True:
         now = time.time()
         if seconds and now - t0 >= seconds:
@@ -1765,10 +1784,18 @@ def run_feed(xd, win, gc, visual, depth, path, seconds, hz, readback,
         if not had_feed:
             had_feed = True
             miss_since = now
-        rects = draw_feed_frame(xd, win, gc, visual, depth, feed,
-                                smooth, sm_state, canvas=canvas)
-        _raise_window(xd, win)
-        _sync(xd, 0)
+        try:
+            rects = draw_feed_frame(xd, win, gc, visual, depth, feed,
+                                    smooth, sm_state, canvas=canvas)
+            _raise_window(xd, win)
+            _sync(xd, 0)
+        except Exception as exc:
+            # The wayland presenter path has per-frame guards (sanitize +
+            # frame try); this X11 path had none: one hostile or broken frame
+            # killed the whole feed loop and left the X window behind.
+            _render_failed("x11 frame", exc, x11_errs)
+            time.sleep(1.0 / hz)
+            continue
         frames += 1
         if debug and now - dbg_last >= 2.0:
             dbg_last = now
@@ -2142,19 +2169,58 @@ def frame_rects(feed, smooth=0.0, state=None, fresh=True, view=None):
         except Exception as exc:
             _render_failed("edge", exc, _ERRS)
     merged = merge_overlapping(rects)
-    for (mx, my, msurf) in merged:
-        if msurf.get_width() * msurf.get_height() > 1_500_000:
-            if _san_warn.get("bigrect", 0) < 3:
-                _san_warn["bigrect"] = _san_warn.get("bigrect", 0) + 1
-                print(f"frame_rects: merged rect {mx},{my} {msurf.get_width()}x{msurf.get_height()}"
-                      " > 1.5 MPixel - chained marker cluster, copy cost alarm")
-            break
     if len(merged) > MAX_RECTS:
         if _san_warn["rects"] < 3:
             _san_warn["rects"] += 1
             print(f"frame_rects: {len(merged)} rects > {MAX_RECTS} -> truncated")
         merged = merged[:MAX_RECTS]
-    return merged
+    # The presenter accepts rect payloads only up to the surface itself
+    # (anything above was injected, never legitimately rendered). Split
+    # oversized merged clusters into row-aligned surface slices instead of
+    # only warning about them - the old 'break' merely ended the warning
+    # loop while the oversized rect still went out and desynced the pipe.
+    cap_px = max(1, int(vw) * int(vh))
+    total_cap = 2 * cap_px  # sum over all rects of one frame (presenter cap)
+    final = []
+    for (mx, my, msurf) in merged:
+        w, h = msurf.get_width(), msurf.get_height()
+        if w * h > 1_500_000:
+            if _san_warn.get("bigrect", 0) < 3:
+                _san_warn["bigrect"] = _san_warn.get("bigrect", 0) + 1
+                print(f"frame_rects: merged rect {mx},{my} {w}x{h}"
+                      " > 1.5 MPixel - chained cluster, split for presenter")
+        pieces = ([(mx, my, msurf)] if w * h <= cap_px
+                  else split_surface(mx, my, msurf, cap_px))
+        for piece in pieces:
+            pw, ph = piece[2].get_width(), piece[2].get_height()
+            if pw * ph > total_cap:
+                if _san_warn.get("bigrect", 0) < 3:
+                    _san_warn["bigrect"] = _san_warn.get("bigrect", 0) + 1
+                    print("frame_rects: frame rect total exceeds presenter cap"
+                          " - farther rects dropped")
+                break
+            total_cap -= pw * ph
+            final.append(piece)
+    return final
+
+
+def split_surface(mx, my, surf, cap_px):
+    """Slice a merged surface into row-aligned sub-surfaces of at most
+    cap_px pixels each (pure row copies, no scaling, no recompression)."""
+    w, h = surf.get_width(), surf.get_height()
+    stride = surf.get_stride()
+    data = surf.get_data()
+    rows = max(1, cap_px // max(1, w))
+    pieces = []
+    off = 0
+    while off < h:
+        hh = min(rows, h - off)
+        sub = cairo.ImageSurface.create_for_data(
+            bytearray(data[off * stride:(off + hh) * stride]),
+            cairo.FORMAT_ARGB32, w, hh, stride)
+        pieces.append((mx, my + off, sub))
+        off += hh
+    return pieces
 
 
 def merge_overlapping(rects):
@@ -2239,10 +2305,18 @@ def make_feed_provider(path, trace_path=None, feed_token=""):
     trace_path: log EVERY arriving raw frame (arrival wall time + feed time
     + all markers) as JSON lines - the ground-truth tap for diagnosing feed
     jitter (presence gaps, alternating projections, send cadence).
-    feed_token (ws:// only): every frame must carry tok == feed_token, or it is
-    dropped - this is what protects the CLIENT side against a local process that
-    squats the feed port before the plugin binds it. File feeds (dev tools) are
-    local-only and not authenticated.
+    feed_token (ws:// only, protocol v3): the server first sends
+    {"c":"chal","n":<nonce>,"p":<HMAC-SHA256(key=token,msg=n)>}; the overlay
+    VERIFIES p (proves the real plugin - a process squatting the port cannot
+    forge it) and answers {"c":"auth","r":<same HMAC>} (proves it knows the
+    token). The token itself is never sent. Frames additionally carry a "tok"
+    stamp compared in constant time; mismatches drop the frame. Without a
+    token there is no challenge and any local process dictating the port also
+    dictates the display (--insecure is the only way there). File feeds (dev
+    tools) are local-only and not authenticated.
+    Token changes: the plugin reads its cfg at GAME start, the overlay reads
+    config.json at OVERLAY start - change a token with the game closed, then
+    start the game first, then the overlay (never the other way around).
     """
     trace_fh = None
     trace_state = {"bytes": 0, "noted": False}
@@ -2288,30 +2362,64 @@ def make_feed_provider(path, trace_path=None, feed_token=""):
         import websockets
 
         async def run():
-            handshake_hint = [0]
             while True:
                 try:
                     # close_timeout is mandatory: websockets' default (None) hangs the
                     # closing handshake forever when the server keeps pushing frames
                     # (observed: pump froze after the unauthenticated-server break).
-                    async with websockets.connect(path, max_size=1 << 20,
+                    async with websockets.connect(path, max_size = 1 << 20,
                                                   close_timeout=1.0) as ws:
-                        print(f"ws feed connected: {_mask_url(path, feed_token)}")
+                        if feed_token:
+                            # Protocol v3: the server presents itself FIRST with an
+                            # HMAC over a fresh nonce. Only if that verifies does the
+                            # overlay answer with its own proof - the token itself is
+                            # never sent in either direction. A squatter on the port
+                            # cannot present the proof and is cut off before it
+                            # injects a single frame.
+                            chal = json.loads(await asyncio.wait_for(
+                                ws.recv(), timeout=10.0))
+                            if not (isinstance(chal, dict) and chal.get("c") == "chal"
+                                    and isinstance(chal.get("n"), str)
+                                    and isinstance(chal.get("p"), str)):
+                                raise RuntimeError(
+                                    "server sent no token challenge - not a "
+                                    "QuestMarkersLinux 1.1+ plugin feed (or a process "
+                                    "that cannot prove the feed token)")
+                            expect = hmac.new(feed_token.encode("utf-8"),
+                                              chal["n"].encode("utf-8"),
+                                              hashlib.sha256).hexdigest()
+                            if not hmac.compare_digest(expect, chal["p"]):
+                                raise RuntimeError(
+                                    "server could NOT prove knowledge of the feed "
+                                    "token - refusing the feed (plugin Feed Token vs. "
+                                    "config.json feedToken: same value? game was "
+                                    "restarted after the token change?)")
+                            await ws.send(json.dumps({"c": "auth", "r": expect},
+                                                     separators=(",", ":")))
+                            print(f"ws feed authenticated by challenge: "
+                                  f"{_mask_url(path, feed_token)}")
+                        else:
+                            print(f"ws feed UNAUTHENTICATED (no feed token): "
+                                  f"{_mask_url(path, feed_token)} - only acceptable "
+                                  "against a plugin with an empty Feed Token")
                         auth_fails = 0
                         async for msg in ws:
                             try:
                                 frame = json.loads(msg)
                             except json.JSONDecodeError:
                                 continue
-                            if feed_token and (not isinstance(frame, dict)
-                                               or frame.get("tok") != feed_token):
+                            tok = frame.get("tok") if isinstance(frame, dict) else None
+                            if feed_token and tok is not None \
+                                    and not hmac.compare_digest(feed_token, str(tok)):
                                 auth_fails += 1
                                 if auth_fails == 1:
-                                    print("ws feed: frames without matching tok are REJECTED "
-                                          "(feed server unauthenticated - check Feed Token "
-                                          "in plugin cfg and config.json feedToken)")
+                                    print("ws feed: frame tok stamp mismatch REJECTED "
+                                          "(token drift between plugin cfg and "
+                                          "config.json: token changes take effect only "
+                                          "after restarting the GAME first, then the "
+                                          "overlay)")
                                 if auth_fails >= 3:
-                                    print("ws feed: server redial after unauthenticated frames")
+                                    print("ws feed: server redial after token-mismatched frames")
                                     await asyncio.sleep(2.0)
                                     break
                                 continue
@@ -2320,15 +2428,6 @@ def make_feed_provider(path, trace_path=None, feed_token=""):
                             trace(frame)
                 except Exception as e:
                     print(f"ws feed: {_mask_url(str(e), feed_token)} (retry in 2 s)")
-                    s = str(e)
-                    if ("valid HTTP response" in s or "401" in s or "403" in s) \
-                            and handshake_hint[0] < 2:
-                        handshake_hint[0] += 1
-                        print("ws feed: handshake rejected by the feed server. Both "
-                              "sides read their token only at startup: the plugin cfg "
-                              "at GAME start, config.json at OVERLAY start. Edit both "
-                              "with the game closed, restart the game, then restart "
-                              "the overlay.")
                     time.sleep(2.0)
         threading.Thread(target=lambda: asyncio.run(run()), daemon=True).start()
 
@@ -2519,8 +2618,13 @@ def main():
                         "(diagnoses feed jitter: presence gaps, projection steps).")
     p.add_argument("--feed-token", default=None, metavar="TOKEN",
                    help="Shared feed secret (default: config.json feedToken). "
-                        "ws:// feeds append ?token=<value> and every frame must "
-                        "carry it back (protects against a spoofed feed server).")
+                        "ws:// feeds authenticate via challenge/response - the "
+                        "token itself is never sent; both sides prove they know "
+                        "it (protects against spoofed servers AND port squatters).")
+    p.add_argument("--insecure", action="store_true",
+                   help="Allow a ws:// feed WITHOUT a feed token (no challenge - "
+                        "any local process could inject frames). Only for testing "
+                        "against a plugin whose Feed Token is empty.")
     p.add_argument("--keep", action="store_true")
     p.add_argument("--smooth", type=float, default=None,
                    help="EMA smoothing time constant in seconds "
@@ -2571,8 +2675,17 @@ def main():
         except ImportError:
             print("websockets module required for ws:// feeds: .venv/bin/pip install websockets")
             return 2
-        if args.feed_token:
-            args.feed += ("&" if "?" in args.feed else "/?") + "token=" + args.feed_token
+        # A ws:// feed without a token is refused by default: without the
+        # challenge ANY process on this machine that accepts the connection
+        # could dictate what is displayed. The token is NEVER appended to the
+        # URL (it would leak into logs and ps output) - the provider runs the
+        # challenge handshake with it instead.
+        if not args.feed_token and not args.insecure:
+            print("refusing an unauthenticated ws:// feed: set feedToken "
+                  "(config.json / --feed-token, matching the plugin's Feed "
+                  "Token) or pass --insecure to test against a plugin with an "
+                  "empty Feed Token.")
+            return 2
     global FONT
     font = cfg.get("font", FEATURE_DEFAULTS["font"])
     if isinstance(font, str) and len(font) <= 128:
@@ -2625,23 +2738,26 @@ def main():
     map_and_raise(xd, win)  # XGetImage on an UNMAPPED window is BadMatch
 
     rc = 0
-    if args.test:
-        rc = run_test(xd, win, gc, visual, depth, W, H, X, Y)
-    elif args.feed:
-        canvas = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H) if depth == 32 else None
-        rc = run_feed(xd, win, gc, visual, depth, args.feed,
-                      args.seconds, args.hz, args.readback, args.smooth,
-                      canvas=canvas, debug=args.debug, trace=args.trace,
-                      feed_token=args.feed_token)
-    else:
-        print("nothing to do (use --test or --feed)")
-        rc = 2
-
-    if not args.keep:
-        _unmap_window(xd, win)
-        _destroy_window(xd, win)
-        _sync(xd, 0)
-        _close_display(xd)
+    try:
+        if args.test:
+            rc = run_test(xd, win, gc, visual, depth, W, H, X, Y)
+        elif args.feed:
+            canvas = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H) if depth == 32 else None
+            rc = run_feed(xd, win, gc, visual, depth, args.feed,
+                          args.seconds, args.hz, args.readback, args.smooth,
+                          canvas=canvas, debug=args.debug, trace=args.trace,
+                          feed_token=args.feed_token)
+        else:
+            print("nothing to do (use --test or --feed)")
+            rc = 2
+    finally:
+        # A crash inside a feed frame must not leave an invisible full-screen
+        # override window (X11) mapped on the desktop.
+        if not args.keep:
+            _unmap_window(xd, win)
+            _destroy_window(xd, win)
+            _sync(xd, 0)
+            _close_display(xd)
     return rc
 
 

@@ -419,6 +419,7 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     size_t payload_cap = 0;
+    size_t frame_seen = 0;   /* summed rect payload bytes of one frame */
     unsigned char *payload = NULL;
     int desync = 0;
 
@@ -455,6 +456,7 @@ int main(int argc, char **argv)
         bb_x1 = 0;
         bb_y1 = 0;
         clear_rects(slot);
+        frame_seen = 0;
 
         if (type == 'F') {
             uint32_t n;
@@ -472,18 +474,32 @@ int main(int argc, char **argv)
                 }
                 struct rect_def r = { hdr[0], hdr[1], hdr[2], hdr[3], hdr[4] };
                 size_t len = (size_t)r.stride * (size_t)r.h;
-                if (r.stride <= 0 || r.h <= 0) {
+                if (r.stride <= 0 || r.h <= 0 || r.w <= 0) {
+                    desync = 1;
+                    break;
+                }
+                if ((size_t)r.stride < 4u * (size_t)r.w) {
+                    /* stride smaller than the row it claims to carry would let
+                     * the clipped memcpy read past the payload row boundary */
+                    desync = 1;
+                    break;
+                }
+                /* Cap derived from the live surface (st.frame_bytes) instead
+                 * of a flat 17 MiB: the overlay splits merged rects at its
+                 * surface size, so a rect bigger than this surface is hostile
+                 * or corrupt - while 4K legitimately needs up to 33 MB. */
+                if (len > st.frame_bytes) {
+                    desync = 1;
+                    break;
+                }
+                frame_seen += len;
+                if (frame_seen > 2 * st.frame_bytes) {
+                    /* disjoint rects cannot legitimately cover more than the
+                     * surface area; two surfaces' worth bounds hostile sums */
                     desync = 1;
                     break;
                 }
                 if (len > payload_cap) {
-                    if (len > 17u * 1024 * 1024) {
-                        /* Hard ceiling: the overlay enforces len <= frame_bytes
-                         * (14.7 MB at 4K), so 17 MiB covers legitimate large
-                         * surfaces while a bogus header stays memory-bounded. */
-                        desync = 1;
-                        break;
-                    }
                     payload = realloc(payload, len);
                     if (!payload) {
                         desync = 1;

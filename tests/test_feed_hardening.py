@@ -1,8 +1,10 @@
 """Feed-hardening battery (security-review MEDIUM/LOW findings).
 
 Covers the provider-boundary sanitize (viewport guard, marker/label/coord/
-distance caps), cfg clamps for feed-injected geometry values, frame_rects
-defense in depth (hostile v, MAX_RECTS wire cap), --trace size cap, token
+distance caps, per-marker sc/ic + edge w/h/sc DoS clamps, unhashable state
+drop), cfg clamps for feed-injected geometry values, frame_rects defense in
+depth (hostile v, MAX_RECTS wire cap, surface-cap splitting of oversized
+merged clusters, per-frame payload total cap), --trace size cap, token
 masking in log lines and overlay.log startup rotation.
 
 Run: .venv/bin/python3 tests/test_feed_hardening.py
@@ -65,6 +67,22 @@ check("t numeric", isinstance(san["t"], float))
 check("edge list sanitized", len(san["e"]) == 1 and math.isfinite(san["e"][0]["x"])
       and san["e"][0]["op"] <= 1.0)
 
+# 2b) DoS fields that used to pass through the sanitize unclamped
+hostile2 = {"t": 1, "v": [2560, 1440],
+            "m": [{"k": "Q", "l": "x", "nx": 0.5, "ny": 0.5, "d": 5,
+                   "sc": 1e9, "ic": -50, "s": ["evil", "list"]}],
+            "e": [{"x": 10, "y": 10, "w": 1e9, "h": 1e9, "sc": 1e9, "op": 1}]}
+san2 = overlay.sanitize_feed(hostile2)
+assert san2 is not None
+check("marker sc/ic clamped to sane multipliers",
+      0.1 <= san2["m"][0]["sc"] <= 8.0 and 0.1 <= san2["m"][0]["ic"] <= 8.0,
+      f"sc={san2['m'][0]['sc']} ic={san2['m'][0]['ic']}")
+check("non-string state dropped (unhashable key-tuple crash class)",
+      san2["m"][0]["s"] is None, repr(san2["m"][0]["s"]))
+check("edge w/h/sc clamped",
+      1.0 <= san2["e"][0]["w"] <= 4096.0 and 1.0 <= san2["e"][0]["h"] <= 4096.0
+      and 0.1 <= san2["e"][0]["sc"] <= 8.0)
+
 # 3) regression class: v=[0,0] used to ZeroDivisionError and lose whole frames
 legacy = {"t": time.time(), "v": [0, 0],
           "m": [{"k": "Extract", "l": "Factory Exit", "x": 900, "y": 400, "d": 50}]}
@@ -75,7 +93,19 @@ check("v=[0,0] legacy feed renders (no ZeroDivisionError)", len(rects) > 0, f"{l
 rects2 = overlay.frame_rects({"t": time.time(), "v": [0, 0],
                               "m": [{"k": "Quest", "l": "Q", "nx": 0.5, "ny": 0.5, "d": 10}]},
                              0.0, {})
-check("frame_rects guards hostile v itself", isinstance(rects2, list) and len(rects2) >= 0)
+check("frame_rects guards hostile v itself", isinstance(rects2, list)
+      and len(rects2) == 1, f"{len(rects2)} rects (expected exactly 1 rendered marker)")
+
+# 3b) oversized merged clusters are SPLIT, not merely warned about
+big = overlay.cairo.ImageSurface(overlay.cairo.FORMAT_ARGB32, 3000, 2000)
+cap = 2560 * 1440
+pieces = overlay.split_surface(100, 200, big, cap)
+check("split_surface: pieces within cap, rows fully covered, offsets continue",
+      all(p[2].get_width() * p[2].get_height() <= cap for p in pieces)
+      and sum(p[2].get_height() for p in pieces) == 2000
+      and pieces[0][1] == 200
+      and pieces[-1][1] + pieces[-1][2].get_height() == 200 + 2000,
+      f"{len(pieces)} pieces")
 
 # 4) rect hard cap: 3000 markers bypassing the provider cap
 feed = {"t": time.time(), "v": [2560, 1440],
@@ -83,6 +113,10 @@ feed = {"t": time.time(), "v": [2560, 1440],
                "ny": 0.1 + (i % 70) / 100, "d": 10 + i} for i in range(3000)]}
 rects3 = overlay.frame_rects(feed, 0.0, {})
 check("rect count hard-capped at MAX_RECTS", 0 < len(rects3) <= overlay.MAX_RECTS, f"{len(rects3)}")
+areas3 = [r[2].get_width() * r[2].get_height() for r in rects3]
+check("every rect within surface cap and frame total within presenter cap",
+      all(a <= 2560 * 1440 for a in areas3) and sum(areas3) <= 2 * 2560 * 1440,
+      f"total {sum(areas3)} px (cap {2 * 2560 * 1440})")
 
 # 5) file provider hands out sanitized frames (hostile latest.json)
 feed_path = os.path.join(tmp, "latest.json")

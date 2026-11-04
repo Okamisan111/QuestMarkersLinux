@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            libwayland-dev wayland-protocols \
+            libcairo2-dev python3-dev
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pycairo websockets pillow
+
+      - name: Build Wayland presenter
+        run: bash wayland/build.sh
+
+      # The plugin DLL itself references BepInEx/UnityEngine (game DLLs, not
+      # redistributable) so it cannot be built in CI. The feed server code is
+      # compiled STANDALONE by the harness - protocol-identical to production.
+      - name: Build feed-server harness (plugin/src/WsServer.cs unchanged)
+        run: dotnet build tests/plugin/WsHarness.csproj -c Release -v quiet
+
+      - name: Syntax check
+        run: python -m py_compile overlay.py feed_sim.py tests/*.py
+
+      - name: Feed protocol tests (mock servers)
+        run: python tests/test_feed_auth.py
+
+      - name: Feed protocol tests (real WsServer.cs harness)
+        run: python tests/test_plugin_ws.py
+
+      - name: Feed hardening battery
+        run: python tests/test_feed_hardening.py
+
+      - name: Frame geometry & smoothing batteries
+        run: |
+          python tests/test_frame_rects.py
+          python tests/test_smooth.py
+
+      - name: Presenter artifact checksums
+        run: |
+          sha256sum wayland/wayland_present | tee presenter.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wayland_presenter
+          path: |
+            wayland/wayland_present
+            presenter.sha256

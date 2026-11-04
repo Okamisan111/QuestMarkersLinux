@@ -60,7 +60,7 @@ Sections: **General**, **Display**, **Filter**, **Debug** — all English.
 | `General / Second key shows` | Extracts | what the second key marks |
 | `General / Show in raid automatically` | true | show feed automatically at raid start |
 | `General / Feed Port`, `Feed Hz` | 9378, 60 | WebSocket feed endpoint (Hz 1-180, game-frame-aligned) |
-| `General / Feed Token` | empty (advanced) | shared feed secret — URI `?token=` + `"tok"` per frame; both sides must match (§ Feed Security) |
+| `General / Feed Token` | empty (advanced) | shared feed secret — challenge/response + `"tok"` per frame; both sides must match (§ Feed Security) |
 | `Display / Show Labels`, `Show Distance` | true | label / distance text |
 | `Display / Edge Arrows` | true | off-screen targets as border arrows only |
 | `Display / Marker Scale` | 1.0 | original QuestMarkers size (0.5 = half) |
@@ -97,13 +97,14 @@ and set the same value in the plugin cfg (`General / Feed Token`, advanced
 section). Two different random values on the two sides simply means the
 overlay cannot connect — they are a shared secret, not individual settings.
 
-**Token changes are never hot.** The plugin reads its cfg once at GAME start,
-the overlay reads `config.json` once at OVERLAY start; an edit while either is
-running has no effect (the rejected handshake logs `401` overlay-side and
-`missing/wrong feed token` in the BepInEx log). Worse, BepInEx rewrites the
-cfg from the in-memory config when the game exits — a mid-raid cfg edit can
-be silently undone on exit. Correct order: close the game → set both sides to
-the same value → start the game → start the overlay.
+**Token changes are never hot.** The plugin captures `Feed Token`/`Feed Port`
+once at GAME start and uses that one snapshot for the challenge *and* the
+per-frame `tok` stamp; the overlay reads `config.json` once at OVERLAY start.
+An edit while either is running has no effect (the overlay logs
+`challenge response rejected -> token mismatch?` and redials). Worse, BepInEx
+rewrites the cfg from the in-memory config when the game exits — a mid-raid
+cfg edit can be silently undone on exit. Correct order: close the game → set
+both sides to the same value → start the game → start the overlay.
 
 Feature mirror of the plugin: `labels`, `distance`, `edge`, `scale`,
 `farDistance`, `farScale`, `imperial`, `edgeSize`, `iconScale`, `smooth`,
@@ -125,7 +126,9 @@ before, any non-empty string counted as true), `hz` is clamped to 1..300 and
 `presenter` only ever accepts `wayland` or `x11`.
 
 `feedToken` (CLI override `--feed-token`) is the feed secret — see § Feed Security;
-it is appended to `ws://` connect URIs as `?token=…` and checked in every frame.
+it never leaves the machine: the overlay proves knowledge of it in the
+challenge/response and compares every frame's `tok` against it. A `ws://` feed
+with no token configured is refused unless `--insecure` is passed (dev only).
 
 `overlay.py --debug` prints per-frame feed stats (rect count, feed age, effective
 rate) every 2 s; `--readback` keeps the pixel-readback verification on.
@@ -140,30 +143,43 @@ overlay from the server's single client slot. The handshake enforces:
 - requests carrying an `Origin` header (browsers always send one, RFC6455
   §4.1) are **rejected**; native clients never send it.
 - a shared `Feed Token` (plugin cfg `General / Feed Token`, overlay
-  `config.json feedToken`): the overlay connects with `?token=<token>` and
-  every frame carries `"tok": "<token>"`; an overlay with a token configured
-  drops **every** frame whose `tok` mismatches (redial after 3 failures) —
-  that is what protects the client side against a local process that squats
-  the port before the plugin binds it. An empty plugin token disables only
-  the token check; browser-Origin requests stay rejected either way.
-- handshake headers are capped (8 KB per line, 64 KB total).
+  `config.json feedToken`) with **mutual challenge authentication (v3)**: the
+  token itself is never transmitted — not in a URL, not in a header, not per
+  frame. After the upgrade the server sends
+  `{"c":"chal","n":<nonce>,"p":HMAC-SHA256(key=token,msg=n)}`; the overlay
+  verifies `p` (a squatter on port 9378 cannot fake it, so no injected frame
+  is ever accepted), answers `{"c":"auth","r":<same HMAC>}` within 8 s, and
+  compares every frame's `tok` stamp constant-time. The plugin captures the
+  token once at game start and stamps frames from the same snapshot, so the
+  two sides cannot desync mid-raid. A `ws://` feed without a token is refused
+  unless `--insecure` is passed explicitly (development only).
+- the client slot is taken only after a successful challenge: silent
+  connections get an 8 s auth deadline and a 60 s idle timeout, every client
+  runs on its own thread, and only an AUTHENTICATED client may take over.
+- handshake headers are capped (8 KB per line, 64 KB total) with a 12 s
+  deadline against slow header drips.
 - incoming frames are hardened VIEWER-side too: one `sanitize_feed` pass at
   the provider boundary guards the viewport (`v=[0,0]` used to raise
   ZeroDivisionError and drop whole frames), caps marker count (128), label
   length (160 chars, clipped labels end in a visible `…`) and every
   coordinate/distance field before any rendering or smoothing; `frame_rects`
-  hard-caps the rect list at the presenter's MAXRECTS (2048) and warns about
-  merged rects above 1.5 MPixel. Feed-injected feature values are always
+  hard-caps the rect list at the presenter's MAXRECTS (2048) and splits
+  oversized merged clusters into row-aligned sub-rects at the surface size.
+  Feed-injected feature values are always
   clamped (`iconScale` 0.25-4.0, `edgeSize` 4-192 px, scale 0.1-3.0,
   presenter/font validated; unknown `cfg` keys are dropped). The plugin caps
   its side too: labels are truncated at 120 chars (`…`), a frame is
   byte-budgeted to fit the plugin's 8 KB wire buffer (UTF-8 exact,
   distance-ordered, so the CLOSEST markers are the ones kept), and the
-  presenter accepts rect payloads up to 17 MiB —
-  enough for a 4K surface, still bounded against a bogus header.
+  presenter derives its per-frame payload cap from the live surface size
+  (~33 MB at 4K, ~17 MiB at 1440p) and rejects `stride < 4*w` headers before
+  any memcpy.
   `--trace` JSONL caps at 64 MiB, `logs/overlay.log` rotates at
   startup (8 MiB -> `.1`, one generation), and the feed token never appears
-  in a log line. Batteries: tests/test_feed_auth.py, tests/test_feed_hardening.py.
+  in a log line. Batteries: tests/test_feed_auth.py,
+  tests/test_feed_hardening.py and tests/test_plugin_ws.py — the last one
+  compiles the production `plugin/src/WsServer.cs` unchanged (no game DLLs)
+  and tests the whole protocol from the server side.
 
 File-feed mode (`latest.json`, `feed_sim.py`) is a local dev tool and stays
 unauthenticated. Set your own token value if you share the machine. This is
