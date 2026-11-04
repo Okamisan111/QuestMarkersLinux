@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native quest marker overlay for SPT (Escape From Tarkov) - Wayland only.
+"""Native quest marker overlay for SPT (Escape from Tushonka) - Wayland only.
 
 Transparent, frameless, click-through overlay surface on your game monitor.
 Marker data comes from the bundled BepInEx plugin (live WebSocket feed) or

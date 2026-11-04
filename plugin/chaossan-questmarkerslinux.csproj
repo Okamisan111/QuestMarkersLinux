@@ -22,6 +22,9 @@
       <HintPath>$(SptPath)/BepInEx/core/BepInEx.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- EscapeFromTarkov_Data is the folder name SPT installs on disk. It is a
+         path, not the project name: do not "fix" it to match the renaming, the
+         references would stop resolving. -->
     <Reference Include="UnityEngine.CoreModule">
       <HintPath>$(SptPath)/EscapeFromTarkov_Data/Managed/UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>

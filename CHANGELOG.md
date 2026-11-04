@@ -24,6 +24,12 @@ The overlay is now **Wayland-only**.
 - A Wayland session (KDE Plasma, GNOME and wlroots compositors). X11 and
   XWayland are not supported - that is what produced the black screen.
 
+### Changed
+- Game references now read **Escape from Tushonka** instead of the trademarked
+  name, in the README and the overlay docstring. The `EscapeFromTarkov_Data`
+  folder in the plugin project file is deliberately untouched: it is the path
+  SPT installs on disk, and renaming it would break the reference resolution.
+
 ## v1.1.1 — 2026-11-04
 
 Supersedes the `v1.1.0` tag, which was still built on feed protocol v3: there,
