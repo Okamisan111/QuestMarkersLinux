@@ -35,6 +35,11 @@ gives you the quest-marker HUD you know from mods on Windows:
 It is a port inspired by **maschine's QuestMarkers** (MIT). Same look, same
 idea, rebuilt for Linux.
 
+![Quest markers in a raid: pins with quest names and distances, plus edge arrows for off-screen targets](docs/example.webp)
+
+*In a raid: off-screen objectives appear as arrows at the screen edge, visible
+ones as pins with name and distance.*
+
 ### Read this first
 
 > **The plugin cannot draw anything by itself.**
@@ -425,6 +430,7 @@ plugin/
 wayland/
   wayland_present.c         native presenter (Wayland layer-shell)
   build.sh                  builds it, vendored protocol XML
+docs/example.webp           the screenshot above
 tests/                      the test batteries above
 tools/                      trace replay/report helpers
 ```
