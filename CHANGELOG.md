@@ -1,6 +1,13 @@
 # Changelog
 
-## v1.1.0 — 2026-11-04
+## v1.1.1 — 2026-11-04
+
+Supersedes the `v1.1.0` tag, which was still built on feed protocol v3: there,
+the expected answer equalled the proof the server sent, so any local process
+could echo the challenge, be admitted into the single client slot and also
+receive the raw token inside every frame. v1.1.0 also sent malformed frames
+while markers were hidden, freezing the display for about a second. Plugin and
+overlay **1.1.1** must be used together; install both.
 
 Protocol **breaking** release: the overlay feed now uses mutual challenge
 authentication (feed protocol v4). Plugin 1.1.x and overlay 1.1.x must be
