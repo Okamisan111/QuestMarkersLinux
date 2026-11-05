@@ -124,11 +124,19 @@ internal sealed class BridgeScanner
             if (status != (int)EQuestStatus.Started && status != (int)EQuestStatus.AvailableForFinish) continue;
             if (quest.Conditions == null) continue;
             if (!quest.Conditions.TryGetValue(EQuestStatus.AvailableForFinish, out ConditionCollection conds) || conds == null) continue;
-            string label = Escape(quest.Template?.Name ?? "Quest");
+            // Clamp the NAME (not the "(i/n)" index) so the per-marker wire cap
+            // in Plugin.BuildFrame can never cut the objective index off.
+            string label = ObjectiveLabeler.Clamp(Escape(quest.Template?.Name ?? "Quest"), 112);
+            int first = targets.Count;      // where THIS quest's world targets start
             foreach (Condition condition in conds)
             {
                 AddCondition(quest, condition, label);
             }
+            // Several objectives of the SAME quest share the quest name: number
+            // them in enumeration order so a meter value is attributable to one
+            // objective instead of looking like the same marker changed its mind.
+            IList<string> numbered = ObjectiveLabeler.Labels(label, targets.Count - first);
+            for (int i = first; i < targets.Count; i++) targets[i].Label = numbered[i - first];
         }
     }
 

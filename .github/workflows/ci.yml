@@ -55,6 +55,9 @@ jobs:
       - name: Feed hardening battery
         run: python tests/test_feed_hardening.py
 
+      - name: Quest objective label battery (plugin/src/ObjectiveLabels.cs)
+        run: python tests/test_plugin_labels.py
+
       - name: Frame geometry & smoothing batteries
         run: |
           python tests/test_frame_rects.py

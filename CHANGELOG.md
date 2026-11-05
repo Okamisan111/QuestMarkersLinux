@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.2.1 — 2026-11-05
+
+### Changed
+- **Quest objectives carry an index.** One quest can carry several world
+  objectives (the backported "Signal - Part 1" has four: two VisitPlace zones and
+  two PlaceBeacon zones). They all read the quest name with different meters,
+  which looks like the same marker showing a different distance. They now read
+  `Signal - Part 1 (1/4)` … `(4/4)`. The index is that quest's own objective
+  order — independent of distance, camera angle and which markers the wire budget
+  kept — so the number a player reads belongs to the same objective for the whole
+  raid. Single-objective quests keep the plain quest name.
+  Marker boxes keep their exact projected positions: overlapping objectives still overlap and
+  are composited as one cluster, exactly as the original mod drew them — the objective index is
+  what makes a meter value attributable. New battery:
+  `tests/test_plugin_labels.py`. The plugin and the overlay belong together.
+
 ## v1.2.0 — 2026-11-04
 
 The overlay is now **Wayland-only**.

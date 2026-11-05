@@ -28,8 +28,9 @@ internal static class Harness
         }
     }
 
-    private static int Main()
+    private static int Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "labels") return Labels();
         using (var server = new WsServer(Port, Token, msg =>
         {
             Console.WriteLine("[server] " + msg);
@@ -52,6 +53,40 @@ internal static class Harness
                 Thread.Sleep(25);
             }
             Console.WriteLine("HARNESS-DONE frames=" + i);
+        }
+        return 0;
+    }
+
+    /// `ws-harness labels`: reads "label<TAB>count" lines and prints exactly the
+    /// labels plugin/src/ObjectiveLabels.cs produces for that many world targets
+    /// of one quest - the same production code path tests/test_plugin_labels.py
+    /// checks, without Unity or BepInEx.
+    private static int Labels()
+    {
+        string line;
+        while ((line = Console.ReadLine()) != null)
+        {
+            if (line.Length == 0) continue;
+            string[] parts = line.Split('\t');
+            int count;
+            if (parts.Length < 2 || !int.TryParse(parts[1],
+                    System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture, out count))
+            {
+                Console.WriteLine("BAD\t" + line);
+                continue;
+            }
+            foreach (string l in QuestMarkersLinux.ObjectiveLabeler.Labels(parts[0], count))
+                Console.WriteLine(l);
+            // third column: also report the wire-budget clamp of the NAME
+            if (parts.Length >= 3)
+            {
+                int maxChars;
+                if (int.TryParse(parts[2], System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture, out maxChars))
+                    Console.WriteLine("clamp:" + QuestMarkersLinux.ObjectiveLabeler.Clamp(parts[0], maxChars));
+            }
+            Console.WriteLine("--");
         }
         return 0;
     }
