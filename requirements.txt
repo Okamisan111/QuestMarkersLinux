@@ -1,0 +1,8 @@
+# Runtime dependencies of the Wayland overlay (overlay.py).
+#
+# pycairo publishes NO manylinux wheels (PyPI 1.29.2 ships Windows wheels only),
+# so pip compiles it against the system cairo: install the cairo dev headers and
+# pkg-config first - see the Requirements table in README.md. websockets is pure
+# Python. Versions are pinned so a fresh install reproduces the tested pairing.
+pycairo==1.29.2
+websockets==17.4

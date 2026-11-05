@@ -62,7 +62,7 @@ ones as pins with name and distance.*
 | SPT 4.1 installed and running under Wine/Proton | the plugin lives inside the game process | you can play SPT |
 | BepInEx 5 in your SPT folder | loads the plugin | `<SPT>/BepInEx/core/BepInEx.dll` exists |
 | Python 3.10+ | runs the overlay | `python3 --version` |
-| `pycairo` + `websockets` | drawing and the feed connection | installed in a venv below |
+| `pycairo` + `websockets` | drawing and the feed connection | pinned in `requirements.txt`, installed in a venv below |
 | cairo dev headers + `pkg-config` | `pycairo` needs them to build | `pkg-config --modversion cairo` |
 | `gcc` + `wayland-client` dev | builds the native presenter | `pkg-config --modversion wayland-client` |
 
@@ -81,7 +81,7 @@ cd QuestMarkersLinux
 
 # 1) Python environment (local venv, nothing system-wide, no root)
 python3 -m venv .venv
-.venv/bin/pip install pycairo websockets
+.venv/bin/pip install -r requirements.txt
 
 # 2) build the native presenter
 bash wayland/build.sh

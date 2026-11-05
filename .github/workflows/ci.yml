@@ -7,6 +7,10 @@ on:
   release:
     types: [published]
 
+# The release job uploads an asset to the published release.
+permissions:
+  contents: write
+
 jobs:
   tests:
     runs-on: ubuntu-24.04
@@ -32,7 +36,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pycairo websockets pillow
+          python -m pip install -r requirements.txt
 
       - name: Build Wayland presenter
         run: bash wayland/build.sh
@@ -72,3 +76,36 @@ jobs:
           path: |
             wayland/wayland_present
             presenter.sha256
+
+  release_asset:
+    name: Attach the plugin build to the release
+    needs: tests
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The plugin references BepInEx/UnityEngine (game DLLs, not redistributable),
+      # so CI cannot build it - it ships the tracked build instead. That only works if
+      # the tracked build really is the tagged version: a tag whose build reports
+      # another version has happened before in this project.
+      - name: Tracked build must match the tag
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          if strings -a -el plugin/bin/Release/chaossan-questmarkerslinux.dll | grep -Fxq "$ver"; then
+            echo "tracked DLL reports $ver"
+          else
+            echo "::error::plugin/bin/Release/chaossan-questmarkerslinux.dll does not report $ver - bump PluginVersion, rebuild and commit the DLL before tagging"
+            exit 1
+          fi
+
+      - name: Package the plugin for BepInEx
+        run: |
+          mkdir -p dist
+          cp plugin/bin/Release/chaossan-questmarkerslinux.dll dist/
+          cd dist && zip -j "QuestMarkersLinux-plugin-${GITHUB_REF_NAME#v}.zip" chaossan-questmarkerslinux.dll
+
+      - name: Upload the asset to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "dist/QuestMarkersLinux-plugin-${GITHUB_REF_NAME#v}.zip" --clobber
