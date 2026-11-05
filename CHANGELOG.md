@@ -16,6 +16,15 @@
   what makes a meter value attributable. New battery:
   `tests/test_plugin_labels.py`. The plugin and the overlay belong together.
 
+### Packaging
+- Dependencies are pinned in `requirements.txt` (`pycairo==1.29.2`,
+  `websockets==17.4`): `pip install -r requirements.txt` reproduces the tested
+  pairing. `pycairo` ships no manylinux wheels, so it compiles against the system
+  cairo — the cairo dev headers are required either way.
+- The release ships the plugin as `QuestMarkersLinux-plugin-<version>.zip`; unzip
+  it into `BepInEx/plugins/`. CI attaches that asset when a release is published
+  and refuses it if the tracked build does not report the tagged version.
+
 ## v1.2.0 — 2026-11-04
 
 The overlay is now **Wayland-only**.

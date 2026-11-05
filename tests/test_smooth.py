@@ -17,6 +17,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import overlay as ov
 
 TAU = 0.045
+REAL_MONOTONIC = time.monotonic
+
+
+class VirtualClock:
+    """smooth_pos and the legacy EMA both read time.monotonic(); feeding them a
+    synthetic clock turns the staircase battery into an exact measurement. The
+    wall-clock version measured whatever the scheduler gave it and drifted to
+    0.415 on a loaded GitHub runner against a 0.4 assert."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def __enter__(self):
+        time.monotonic = self.monotonic
+        return self
+
+    def __exit__(self, *exc):
+        time.monotonic = REAL_MONOTONIC
 
 
 def old_smooth(st, key, x, y, tau):
@@ -39,25 +60,28 @@ def old_smooth(st, key, x, y, tau):
 def test_staircase_constant_motion():
     """Decisive anti-zappeln test: 15 Hz sampling (game-FPS staircase),
     120 Hz render, constant 300 px/s true motion. New smoother: near-constant
-    display steps. Legacy EMA on the same staircase: pulsating steps."""
-    meas_t0 = time.monotonic()
+    display steps. Legacy EMA on the same staircase: pulsating steps.
 
-    def measurement(now):
-        return 300.0 * (((now - meas_t0) // 0.0667) * 0.0667)
+    Driven by a synthetic clock: the measurement grid is exactly 1/120 s and the
+    sample staircase exactly 0.0667 s, so every run computes the same numbers.
+    A real-time version here tests the load of the machine, not the smoother."""
+    sample, tick, ticks = 0.0667, 1 / 120, 3000      # 25 s of virtual time
+    st, st_o = {}, {}
+    steps, lags, steps_o = [], [], []
+    prev_d = prev_o = None
+    with VirtualClock() as clock:
+        for i in range(ticks):
+            clock.t = i * tick
+            mx = 300.0 * ((clock.t // sample) * sample)
+            d, _ = ov.smooth_pos(st, "q", mx, 100.0, TAU)
+            do = old_smooth(st_o, "q", mx, 100.0, 0.030)[0]
+            if prev_d is not None:
+                steps.append(d - prev_d)
+                lags.append(mx - d)
+            if prev_o is not None:
+                steps_o.append(do - prev_o)
+            prev_d, prev_o = d, do
 
-    st = {}
-    steps, lags = [], []
-    prev_d = None
-    t0 = time.monotonic()
-    while time.monotonic() - t0 <= 2.5:
-        now = time.monotonic()
-        mx = measurement(now)
-        d, _ = ov.smooth_pos(st, "q", mx, 100.0, TAU)
-        if prev_d is not None:
-            steps.append(d - prev_d)
-        lags.append(mx - d)
-        prev_d = d
-        time.sleep(1 / 120)
     moving = steps[30:-10]
     med = sorted(moving)[len(moving) // 2]
     lo, hi = min(moving), max(moving)
@@ -68,23 +92,13 @@ def test_staircase_constant_motion():
     assert lo >= 0.55 * med, "micro-stops (zappeln) in display motion"
     assert lag_max <= 32.0, lag_max
 
-    st_o = {}
-    steps_o = []
-    prev_d = None
-    t0 = time.monotonic()
-    while time.monotonic() - t0 <= 2.5:
-        now = time.monotonic()
-        mx = measurement(now)
-        d = old_smooth(st_o, "q", mx, 100.0, 0.030)[0]
-        if prev_d is not None:
-            steps_o.append(d - prev_d)
-        prev_d = d
-        time.sleep(1 / 120)
     mo = steps_o[30:-10]
     mo_med = sorted(mo)[len(mo) // 2]
     micro = min(mo) / max(mo_med, 1e-9)
-    print(f"staircase legacy: min/med={micro:.2f} (must be <0.4 - old stutter)")
+    print(f"staircase legacy: min/med={micro:.2f} (must be <0.4 - old stutter) "
+          f"relative to new smoother: {micro / max(lo / med, 1e-9):.2f}")
     assert micro < 0.4, micro
+    assert micro <= 0.7 * (lo / med), "legacy stutter not discriminated from the new smoother"
 
 
 def test_close_parallax(jitter):
