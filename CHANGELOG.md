@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Semi-transparent markers.** New plugin setting `Display / Marker Opacity`
+  (1.0 = opaque … 0.05 = watermark) and the overlay-side `markerAlpha` in
+  `config.json`; the two multiply. The overlay gives every part of a marker its
+  own share of what is left (`ALPHA_WEIGHTS`, `layer alpha = 1 − (1 − opacity) ×
+  weight`): the tagbox background and the pin fill open up, the 1 px outlines,
+  the kind icon and the distance text stay mostly solid, the quest label never
+  fades. A flat 1:1 fade would wash the text out before the background opens.
+- Measured on KWin/KDE at opacity 0.45: tagbox plate A115 (was A255), outlines
+  A216, kind icon A213, distance A244, quest label A255 — A249 … A253 for a
+  marker that moves, where sub-pixel anchoring resamples the glyph cores.
+  Below `op = 0.01` a marker is dropped rather than drawn invisibly; hostile
+  config values are clamped on the plugin side and sanitized on the overlay side.
+- The feed frame carries `"op":1` per marker. A bare integer while the setting
+  is untouched keeps the wire byte-identical for existing setups; only a lowered
+  opacity adds ~9 bytes per marker per frame (~17 KiB/s at 64 markers, 30 Hz).
+- New battery `tests/test_alpha.py`: tier arithmetic, premultiplied ARGB32
+  expectations on the real components (plate, tagbox outline, pins, kind icon,
+  label/distance text), composited markers at 1.0 / 0.45 / 0.16, hostile `op`
+  values (0, negative, 1e9, inf, nan, strings, booleans), `markerAlpha` × wire
+  `op` stacking, cache buckets, edge arrows, and disjoint presenter footprints
+  for the exact-memcpy damage control.
+
+### Performance
+- Default opacity: 2.80 → 2.81 ms per frame (64 markers, 1280×720, render +
+  merge) — no measurable regression. Rendering while translucent costs about
+  19 % more of that frame time; the presenter path is unchanged.
+
 ## v1.2.1 — 2026-11-05
 
 ### Changed

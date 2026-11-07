@@ -96,6 +96,23 @@ BOX_MIN_W = 28          # box at least as wide as the pin
 SC = 1.0                # global scale (CLI --scale / config "scale")
 EDGE_MAX_DIST = 250     # max px an edge arrow may sit away from the screen edge
 
+# Semi-transparency, tiered. One scalar per marker reaches the renderer: the
+# plugin's in-game "Marker Opacity" arrives as the wire field "op", an
+# overlay-side "markerAlpha" (config.json) multiplies it. Each layer then keeps
+# its own share of what is left:  layer alpha = 1 - (1 - opacity) * ALPHA_WEIGHTS
+# So opacity 1.0 (the default, and the value a plugin older than 1.2.2 sends)
+# reproduces the fully opaque look pixel for pixel, while lowering it opens the
+# tagbox/pin background up but holds the outlines and text readable over bright
+# maps (snow, sand, concrete) - a flat 1:1 fade would wash the text out first.
+ALPHA_WEIGHTS = {
+    "plate": 1.00,     # tagbox background
+    "pin": 1.00,       # pin fill
+    "border": 0.50,    # 1 px outlines: separation from the map matters most
+    "icon": 0.30,      # kind icon strokes + accent fills
+    "label": 0.00,     # quest label text: never transparent
+    "dist": 0.08,      # distance text
+}
+
 # Config features (keys are English; the overlay reads the plugin's
 # config.json when present and the feed may override them per frame via "cfg").
 FEATURE_DEFAULTS = {
@@ -109,6 +126,10 @@ FEATURE_DEFAULTS = {
     "imperial": False,       # ImperialUnits: display feet / miles instead of m / km
     "smooth": 0.045,         # chord seam-blend time [s] (0 = raw feed);
                              # overlay-side only - not an in-game option
+    "markerAlpha": 1.0,      # 1.0 = fully opaque (today's look). Below 1 the
+                             # tagbox/pin background turns see-through, outlines
+                             # and text keep most of their opacity (ALPHA_WEIGHTS
+                             # below). Multiplies the plugin's "Marker Opacity".
     "edgeSize": 24,          # EdgeArrowSize [px]: arrow long side at scale 1
     "iconScale": 1.0,        # symbol multiplier: pin geometry + kind icon
                              # (text stays readable). 1.0 is the standard size
@@ -330,7 +351,7 @@ def cfg_of(feed=None):
             raise ValueError("config must be a JSON object")
         for key in ("labels", "distance", "edge", "scale", "farDistance",
                     "farScale", "imperial", "edgeSize", "font",
-                    "iconScale", "smooth"):
+                    "iconScale", "smooth", "markerAlpha"):
             if key in user_cfg:
                 cfg[key] = user_cfg[key]
     except Exception:
@@ -341,6 +362,10 @@ def cfg_of(feed=None):
                 cfg[key] = value
     for key, lo, hi in (("scale", 0.1, 3.0), ("farScale", 0.1, 3.0),
                         ("farDistance", 1.0, 100000.0), ("smooth", 0.0, 3.0),
+                        # 0.05 floor: below it every layer would be so thin that
+                        # the markers read as noise, and the op <= 0.01 visibility
+                        # gate would silently swallow them
+                        ("markerAlpha", 0.05, 1.0),
                         # a feed can inject these geometry values directly:
                         # iconScale=1e9 would ask for multi-MB cairo surfaces
                         # per marker, edgeSize likewise - clamp always.
@@ -684,7 +709,7 @@ def _rounded_poly(ctx, pts, r):
     ctx.close_path()
 
 
-def _pin_diamond(ctx, tipx, tipy, sc, color, dash=None):
+def _pin_diamond(ctx, tipx, tipy, sc, color, dash=None, fill_a=1.0, stroke_a=1.0):
     """Extract/exit pin: maschine's 26px square rotated 45 deg about its
     bottom-left corner -> a 4px-rounded diamond whose lower vertex is the
     feed point and whose centre is exactly the teardrop circle centre."""
@@ -692,40 +717,42 @@ def _pin_diamond(ctx, tipx, tipy, sc, color, dash=None):
     cx, cy = float(tipx), tipy - h
     pts = [(cx, tipy), (cx + h, cy), (cx, tipy - 2.0 * h), (cx - h, cy)]
     _rounded_poly(ctx, pts, 4.0 * sc)
-    ctx.set_source_rgba(*_f(PIN_BG), 1.0)
+    _rgba(ctx, PIN_BG, fill_a)
     ctx.fill_preserve()
     ctx.set_line_width(max(1.0, 1.0 * sc))
     if dash:
         ctx.set_dash(dash, 0.0)
-    ctx.set_source_rgba(*_f(color), 1.0)
+    _rgba(ctx, color, stroke_a)
     ctx.stroke()
     if dash:
         ctx.set_dash([], 0.0)
 
 
-def _pin_circle(ctx, tipx, tipy, sc, color, dash=None):
+def _pin_circle(ctx, tipx, tipy, sc, color, dash=None, fill_a=1.0, stroke_a=1.0):
     """Airdrop/BTR pin: a 26px circle whose lower tangent is the feed point
     (maschine seats its rotated square so the circle lands on the marker)."""
     r = PIN_R * sc
     cx, cy = float(tipx), tipy - r
     ctx.move_to(cx + r, cy)
     ctx.arc(cx, cy, r, 0.0, 2.0 * math.pi)
-    ctx.set_source_rgba(*_f(PIN_BG), 1.0)
+    _rgba(ctx, PIN_BG, fill_a)
     ctx.fill_preserve()
     ctx.set_line_width(max(1.0, 1.0 * sc))
     if dash:
         ctx.set_dash(dash, 0.0)
-    ctx.set_source_rgba(*_f(color), 1.0)
+    _rgba(ctx, color, stroke_a)
     ctx.stroke()
     if dash:
         ctx.set_dash([], 0.0)
 
 
-def draw_icon(ctx, k, color, cx, cy, sc=1.0, dim=1.0):
+def draw_icon(ctx, k, color, cx, cy, sc=1.0, dim=1.0, alpha=1.0):
     """Kind icon inside the pin - maschine's 24x24 stroke set, verbatim path
     data (ICONS above; the sheet's exact glyphs, not approximations). Sheet
     fills (flag pennant, flare core, airdrop canopy, BTR hull) get the .25
-    accent fill; strokes are 2px round. Locked state dims to .55."""
+    accent fill; strokes are 2px round. Locked state dims to .55. 'alpha'
+    multiplies both (semi-transparent markers keep the icon legible because its
+    weight in ALPHA_WEIGHTS is well below the plate's)."""
     prims = ICONS.get(k, ICONS["zone"])
     s = 15.0 * sc / 24.0
     ox, oy = cx - 12.0 * s, cy - 12.0 * s
@@ -736,16 +763,39 @@ def draw_icon(ctx, k, color, cx, cy, sc=1.0, dim=1.0):
     for pr in prims:
         _icon_prim(ctx, pr, ox, oy, s)
         if pr[-1]:
-            ctx.set_source_rgba(r, g, b, 0.25 * dim)
+            ctx.set_source_rgba(r, g, b, 0.25 * dim * alpha)
             ctx.fill_preserve()
-            ctx.set_source_rgba(r, g, b, dim)
+            ctx.set_source_rgba(r, g, b, dim * alpha)
             ctx.stroke()
         else:
-            ctx.set_source_rgba(r, g, b, dim)
+            ctx.set_source_rgba(r, g, b, dim * alpha)
             ctx.stroke()
 
 def _rgb(ctx, c):
     ctx.set_source_rgb(c[0] / 255.0, c[1] / 255.0, c[2] / 255.0)
+
+
+def _rgba(ctx, c, a):
+    """Color with an explicit layer alpha (0..1). Clamped: cairo clamps an
+    out-of-range alpha silently, which would turn a bug into an invisible or
+    half-opaque marker instead of a loud one."""
+    ctx.set_source_rgba(c[0] / 255.0, c[1] / 255.0, c[2] / 255.0,
+                        max(0.0, min(1.0, a)))
+
+
+def layer_alpha(opacity, which):
+    """Alpha of one marker layer for a given marker opacity.
+
+    layer alpha = 1 - (1 - opacity) * ALPHA_WEIGHTS[which]: at opacity 1.0 every
+    layer is fully opaque (byte-identical to the pre-transparency renderer), and
+    each layer only gives up as much opacity as its weight allows.
+    """
+    o = _finite(opacity, 1.0)
+    if o is None:
+        o = 1.0
+    o = max(0.0, min(1.0, o))
+    w = ALPHA_WEIGHTS.get(which, 1.0)
+    return 1.0 - (1.0 - o) * w
 
 
 def _f(c):
@@ -768,7 +818,7 @@ def _rounded_rect(ctx, x, y, w, h, r):
     ctx.close_path()
 
 
-def teardrop(ctx, tipx, tipy, sc=1.0, border=None):
+def teardrop(ctx, tipx, tipy, sc=1.0, border=None, fill_a=1.0, stroke_a=1.0):
     """DOM pin: 26 px square, border-radius 50% 50% 50% 0, rotate(-45deg)
     -> circle r=13 with a sharp tip; tip point is exactly (tipx, tipy).
     Border colored per kind (example.png look), falls back to gold."""
@@ -780,10 +830,10 @@ def teardrop(ctx, tipx, tipy, sc=1.0, border=None):
     ctx.line_to(ccx + pr * math.cos(a1), ccy + pr * math.sin(a1))
     ctx.arc_negative(ccx, ccy, pr, 3 * math.pi / 4, a1)
     ctx.close_path()
-    _rgb(ctx, PIN_BG)
+    _rgba(ctx, PIN_BG, fill_a)
     ctx.fill_preserve()
     ctx.set_line_width(max(1.0, round(sc)))
-    _rgb(ctx, border if border is not None else PIN_BORDER)
+    _rgba(ctx, border if border is not None else PIN_BORDER, stroke_a)
     ctx.set_antialias(cairo.ANTIALIAS_NONE)
     ctx.stroke()
     ctx.set_antialias(cairo.ANTIALIAS_DEFAULT)
@@ -800,11 +850,16 @@ def render_marker(m):
     if op <= 0.01:
         return None
     sz = _marker_sizes(m)
+    # one opacity in, six layer alphas out (see ALPHA_WEIGHTS)
+    plate_a = layer_alpha(op, "plate")
+    pin_a = layer_alpha(op, "pin")
+    border_a = layer_alpha(op, "border")
+    icon_a = layer_alpha(op, "icon")
     label = str(m.get("l", ""))
     dist = str(m.get("d", ""))
     color = kind_color(m.get("k", "item"), m.get("s"))
-    lsurf, lw, lbase = _text_surface(label, sz["label_font"], True)
-    dsurf, dw, dbase = _text_surface(dist, sz["dist_font"], False)
+    lsurf, lw, lbase = _text_surface(label, sz["label_font"], True, op)
+    dsurf, dw, dbase = _text_surface(dist, sz["dist_font"], False, op)
     box_w = int(lw) + int(dw) + 2 * sz["pad_x"] + 2
     # box_h budgeted from the real text surfaces: label band + line gap +
     # dist band — descenders can never overflow the tagbox background
@@ -829,14 +884,14 @@ def render_marker(m):
     off = (bw - box_w) / 2.0
     rad = max(2, int(round(4 * sz["sc"])))
     _rounded_rect(sctx, off, box_y, box_w, box_h, rad)
-    _rgb(sctx, BOX_BG)
+    _rgba(sctx, BOX_BG, plate_a)
     sctx.fill()
     # crisp 1 px border: inset path by 0.5 with AA off -> exact PIN_BORDER
     # pixels at the box perimeter (AA strokes blend with fill/bg, never exact)
     sctx.set_antialias(cairo.ANTIALIAS_NONE)
     sctx.set_line_width(1.0)
     _rounded_rect(sctx, off + 0.5, box_y + 0.5, box_w - 1.0, box_h - 1.0, rad)
-    _rgb(sctx, PIN_BORDER)
+    _rgba(sctx, PIN_BORDER, border_a)
     sctx.stroke()
     sctx.set_antialias(cairo.ANTIALIAS_DEFAULT)
     # label bold + dist, centered as DOM does (pasted text surfaces,
@@ -851,14 +906,14 @@ def render_marker(m):
     locked = m.get("s") == "locked"
     dash = [3.0 * sz["pin"], 3.0 * sz["pin"]] if locked else None
     if _shape == "diamond":
-        _pin_diamond(sctx, tipx, tipy, sz["pin"], color, dash)
+        _pin_diamond(sctx, tipx, tipy, sz["pin"], color, dash, pin_a, border_a)
     elif _shape == "circle":
-        _pin_circle(sctx, tipx, tipy, sz["pin"], color, dash)
+        _pin_circle(sctx, tipx, tipy, sz["pin"], color, dash, pin_a, border_a)
     else:
-        teardrop(sctx, tipx, tipy, sz["pin"], color)
+        teardrop(sctx, tipx, tipy, sz["pin"], color, pin_a, border_a)
     _cy = tipy - ((PIN_R if _shape == "circle" else TIP_OFF) * sz["pin"])
     draw_icon(sctx, m.get("k", "item"), color, tipx, _cy, sz["pin"],
-              0.55 if locked else 1.0)
+              0.55 if locked else 1.0, icon_a)
     return surf, bx, by
 
 
@@ -881,6 +936,12 @@ def make_edge_surface(e, W, H):
     sc = SC * float(e.get("sc", 1.0) or 1.0)
     if sc <= 0.05:
         sc = 1.0
+    op = _finite(e.get("op"), 1.0)
+    op = 1.0 if op is None else max(0.0, min(1.0, op))
+    arrow_a = layer_alpha(op, "border")   # arrows stay solid-ish: a see-through
+    border_a = layer_alpha(op, "border")  # border marker is hard to spot
+    plate_a = layer_alpha(op, "plate")
+    dist_a = layer_alpha(op, "dist")
     dist = str(e.get("d", "") or "")
     side = e.get("sd")
     box_w = box_h = 0
@@ -923,11 +984,11 @@ def make_edge_surface(e, W, H):
     ctx.line_to(*pts[1])
     ctx.line_to(*pts[2])
     ctx.close_path()
-    _rgb(ctx, color)
+    _rgba(ctx, color, arrow_a)
     ctx.fill_preserve()
     ctx.set_line_width(1.0)
     ctx.set_antialias(cairo.ANTIALIAS_NONE)
-    _rgb(ctx, PIN_BORDER)
+    _rgba(ctx, PIN_BORDER, border_a)
     ctx.stroke()
     ctx.set_antialias(cairo.ANTIALIAS_DEFAULT)
     if dist:
@@ -935,18 +996,18 @@ def make_edge_surface(e, W, H):
         byy = h + gap
         rad = max(2, int(round(4 * sc)))
         _rounded_rect(ctx, bxx, byy, box_w, box_h, rad)
-        _rgb(ctx, BOX_BG)
+        _rgba(ctx, BOX_BG, plate_a)
         ctx.fill()
         ctx.set_antialias(cairo.ANTIALIAS_NONE)
         ctx.set_line_width(1.0)
         _rounded_rect(ctx, bxx + 0.5, byy + 0.5, box_w - 1.0, box_h - 1.0, rad)
-        _rgb(ctx, PIN_BORDER)
+        _rgba(ctx, PIN_BORDER, border_a)
         ctx.stroke()
         ctx.set_antialias(cairo.ANTIALIAS_DEFAULT)
         ctx.set_font_size(dsz)
         ctx.select_font_face(FONT, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
         dt = ctx.text_extents(dist)
-        _rgb(ctx, DIST_COLOR)
+        _rgba(ctx, DIST_COLOR, dist_a)
         ctx.move_to(bxx + (box_w - dt.width) / 2.0,
                     byy + max(1, int(round(PAD_Y * sc))) + ctx.font_extents()[0])
         ctx.show_text(dist)
@@ -1087,10 +1148,17 @@ _BOX_CACHE = {}
 _PIN_CACHE = {}
 
 
-def _text_surface(text, size, bold):
+def _text_surface(text, size, bold, opacity=1.0):
     """Rendered text surface with cache: glyphs rasterize once per string.
-    Returns (surf, advance, ascent); baseline sits at y=ascent in the surf."""
-    key = (text, size, bold)
+    Returns (surf, advance, ascent); baseline sits at y=ascent in the surf.
+
+    'opacity' maps through layer_alpha (bold text is always the quest label, so
+    the tier follows 'label'/'dist'): quest labels stay fully readable at any
+    opacity, distance text gives up only a little. The rounded alpha is part of
+    the cache key - a changed opacity can never hand back a surface that was
+    rendered for another one."""
+    a = round(layer_alpha(opacity, "label" if bold else "dist"), 3)
+    key = (text, size, bold, a)
     hit = _TEXT_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1113,7 +1181,7 @@ def _text_surface(text, size, bold):
     sctx.select_font_face(FONT, cairo.FONT_SLANT_NORMAL,
                           cairo.FONT_WEIGHT_BOLD if bold else cairo.FONT_WEIGHT_NORMAL)
     sctx.set_font_size(size)
-    _rgb(sctx, LABEL_COLOR if bold else DIST_COLOR)
+    _rgba(sctx, LABEL_COLOR if bold else DIST_COLOR, a)
     sctx.move_to(0, asc)
     sctx.show_text(text)
     hit = (surf, ext.width, asc)
@@ -1121,10 +1189,17 @@ def _text_surface(text, size, bold):
     return hit
 
 
-def _box_bg(box_w, box_h, radius=4):
+def _box_bg(box_w, box_h, radius=4, opacity=1.0):
     """Tagbox background (rounded rect + crisp 1 px kind-color border), cached
-    per (width, height, radius) — same math as render_marker."""
-    surf = _BOX_CACHE.get((box_w, box_h, radius))
+    per (width, height, radius, alpha buckets) — same math as render_marker.
+
+    The border keeps a much higher alpha than the plate (ALPHA_WEIGHTS): a
+    see-through tagbox is only readable while its outline still separates it
+    from the map behind it."""
+    plate_a = round(layer_alpha(opacity, "plate"), 3)
+    border_a = round(layer_alpha(opacity, "border"), 3)
+    key = (box_w, box_h, radius, plate_a, border_a)
+    surf = _BOX_CACHE.get(key)
     if surf is None:
         if len(_BOX_CACHE) > 300:
             _BOX_CACHE.clear()
@@ -1135,25 +1210,31 @@ def _box_bg(box_w, box_h, radius=4):
         sctx.paint()
         sctx.set_operator(cairo.OPERATOR_OVER)
         _rounded_rect(sctx, 0.0, 0.0, box_w, box_h, radius)
-        _rgb(sctx, BOX_BG)
+        _rgba(sctx, BOX_BG, plate_a)
         sctx.fill()
         sctx.set_antialias(cairo.ANTIALIAS_NONE)
         sctx.set_line_width(1.0)
         _rounded_rect(sctx, 0.5, 0.5, box_w - 1.0, box_h - 1.0, 4)
-        _rgb(sctx, PIN_BORDER)
+        _rgba(sctx, PIN_BORDER, border_a)
         sctx.stroke()
         sctx.set_antialias(cairo.ANTIALIAS_DEFAULT)
-        _BOX_CACHE[(box_w, box_h, radius)] = surf
+        _BOX_CACHE[key] = surf
     return surf
 
 
-def _pin_surf(kind, sprite, tipx, tipy, bw, msz=None):
+def _pin_surf(kind, sprite, tipx, tipy, bw, msz=None, opacity=1.0):
     """Pin (kind-colored outline + icon), cached per (kind, sprite, tip offset,
-    width, scale bucket); tip painted at (tipx, tipy) inside the surface."""
+    width, scale bucket, alpha buckets); tip painted at (tipx, tipy) inside the
+    surface. Opacity is quantised into the key so cache hits survive a static
+    opacity but never return a surface built for a different one."""
     msz = msz or _marker_sizes({})
     sc = msz["sc"]
     pin = msz.get("pin", sc)
-    key = (kind, sprite, tipx, tipy, bw, round(sc, 3), round(pin, 3))
+    pin_a = round(layer_alpha(opacity, "pin"), 3)
+    border_a = round(layer_alpha(opacity, "border"), 3)
+    icon_a = round(layer_alpha(opacity, "icon"), 3)
+    key = (kind, sprite, tipx, tipy, bw, round(sc, 3), round(pin, 3),
+           pin_a, border_a, icon_a)
     surf = _PIN_CACHE.get(key)
     if surf is None:
         if len(_PIN_CACHE) > 400:
@@ -1168,14 +1249,14 @@ def _pin_surf(kind, sprite, tipx, tipy, bw, msz=None):
         shape = PIN_SHAPE.get(kind, "teardrop")
         dash = [3.0 * pin, 3.0 * pin] if sprite == "locked" else None
         if shape == "diamond":
-            _pin_diamond(sctx, tipx, tipy, pin, color, dash)
+            _pin_diamond(sctx, tipx, tipy, pin, color, dash, pin_a, border_a)
         elif shape == "circle":
-            _pin_circle(sctx, tipx, tipy, pin, color, dash)
+            _pin_circle(sctx, tipx, tipy, pin, color, dash, pin_a, border_a)
         else:
-            teardrop(sctx, tipx, tipy, pin, color)
+            teardrop(sctx, tipx, tipy, pin, color, pin_a, border_a)
         cy = tipy - (PIN_R * pin if shape == "circle" else TIP_OFF * pin)
         draw_icon(sctx, kind, color, tipx, cy, pin,
-                  0.55 if sprite == "locked" else 1.0)
+                  0.55 if sprite == "locked" else 1.0, icon_a)
         _PIN_CACHE[key] = surf
     return surf
 
@@ -1204,8 +1285,8 @@ def render_marker_cached(m):
     kind = m.get("k", "item")
     sprite = m.get("s")
     msz = _marker_sizes(m)
-    lsurf, lw, lbase = _text_surface(label, msz["label_font"], True)
-    dsurf, dw, dbase = _text_surface(dist, msz["dist_font"], False)
+    lsurf, lw, lbase = _text_surface(label, msz["label_font"], True, op)
+    dsurf, dw, dbase = _text_surface(dist, msz["dist_font"], False, op)
     box_w = int(lw) + int(dw) + 2 * msz["pad_x"] + 2
     box_h = int(math.ceil(msz["pad_y"] + lbase + msz["dist_font"] + msz["pad_y"]
                           + (dsurf.get_height() - dbase)))
@@ -1225,11 +1306,11 @@ def render_marker_cached(m):
     sctx.set_source_rgba(0, 0, 0, 0)
     sctx.paint()
     sctx.set_operator(cairo.OPERATOR_OVER)
-    sctx.set_source_surface(_pin_surf(kind, sprite, tipx, tipy, bw, msz),
-                           1.0 + fx, 1.0 + fy)
+    sctx.set_source_surface(_pin_surf(kind, sprite, tipx, tipy, bw, msz, op),
+                            1.0 + fx, 1.0 + fy)
     sctx.paint()
     off = (bw - box_w) / 2.0
-    sctx.set_source_surface(_box_bg(box_w, box_h, msz["radius"]),
+    sctx.set_source_surface(_box_bg(box_w, box_h, msz["radius"], op),
                             off + 1.0 + fx, 1.0 + fy + box_y)
     sctx.paint()
     sctx.set_source_surface(lsurf, off + (box_w - lw) / 2.0 + 1.0 + fx,
@@ -1289,7 +1370,7 @@ def _edge_arrow(ed, cfg, vw, vh):
         cy = margin if side == "T" else vh - margin
     e = {"k": ed.get("k", "item"), "s": ed.get("s"),
          "x": int(round(cx - w / 2.0)), "y": int(round(cy - h / 2.0)),
-         "w": w, "h": h, "op": 1.0, "sd": side,
+         "w": w, "h": h, "op": float(ed.get("op", 1.0)), "sd": side,
          "d": fmt_dist(ed["meters"], cfg) if cfg["distance"] else ""}
     return make_edge_surface(e, vw, vh)
 
@@ -1355,7 +1436,11 @@ def frame_rects(feed, smooth=0.0, state=None, fresh=True, view=None):
     for m in feed.get("m", []):
         if len(placed) >= MAX_RECTS:
             break
-        op = float(m.get("op", 1.0))
+        # Marker opacity: the wire value ("op" = the plugin's in-game Marker
+        # Opacity, default 1.0) times the overlay-side cfg. The renderer turns
+        # this single scalar into per-layer alphas (ALPHA_WEIGHTS).
+        op = _finite(m.get("op"), 1.0) * _finite(cfg["markerAlpha"], 1.0)
+        op = max(0.0, min(1.0, op))
         if op <= 0.01:
             continue
         meters = parse_meters(m.get("d"))
@@ -1384,7 +1469,7 @@ def frame_rects(feed, smooth=0.0, state=None, fresh=True, view=None):
                 state.pop(key, None)
             if cfg["edge"]:
                 edges.append({"k": m.get("k"), "s": m.get("s"), "nx": nx,
-                              "ny": ny, "meters": meters})
+                              "ny": ny, "meters": meters, "op": op})
             continue
         x, y = nx * vw, ny * vh
         if smooth > 0.0 and state is not None:

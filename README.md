@@ -184,6 +184,7 @@ menu; edit the file (game closed, see [Token changes](#the-feed-token)).
 | `Display / Imperial Units` | off | feet and miles |
 | `Display / Edge Arrow Size` | 24 px | arrow size at scale 1.0 |
 | `Display / Icon Scale` | 1.0 | symbol size multiplier |
+| `Display / Marker Opacity` | 1.0 | see-through markers, 0.05 = watermark, see [semi-transparent markers](#semi-transparent-markers) |
 | `Debug / Debug Log` | off | verbose scan/feed logging |
 
 #### Advanced settings (Better BepInEx)
@@ -215,6 +216,7 @@ repository on purpose — it carries your feed token.
   "imperial": false,
   "edgeSize": 24,
   "iconScale": 1.0,
+  "markerAlpha": 1.0,
   "feedToken": "your-own-random-value"
 }
 ```
@@ -227,6 +229,7 @@ repository on purpose — it carries your feed token.
 | `labels`, `distance`, `edge` | true | mirrors the plugin display options |
 | `scale`, `farDistance`, `farScale`, `iconScale` | 1.0 / 300 / 0.6 / 1.0 | sizes |
 | `edgeSize` | 24 | edge arrow size in px |
+| `markerAlpha` | 1.0 | overlay-side dimmer, multiplies the plugin's `Marker Opacity` |
 | `imperial` | false | feet/miles |
 | `geometry` | null | override the surface placement |
 | `feedToken` | — | shared secret, must equal the plugin's `Feed Token` |
@@ -240,6 +243,34 @@ clamped to 1–300.
 system font. Install it (Arch: AUR `ttf-chakra-petch`; elsewhere:
 fonts.google.com, SIL OFL 1.1) or set `"font": ""` to use the system font on
 purpose.
+
+### Semi-transparent markers
+
+Two knobs multiply: the plugin's `Display / Marker Opacity` (0.05 … 1.0, sent
+as `op` in every marker) and the overlay's `markerAlpha` in `config.json`. The
+overlay then gives every part of a marker its own share of what is left,
+`layer alpha = 1 − (1 − opacity) × weight`:
+
+| part | weight | at opacity 0.45 (measured in the composited marker) |
+|---|---|---|
+| tagbox background, pin fill | 1.00 | A115 — this is what actually opens up |
+| 1 px outlines (tagbox, pin, edge arrows) | 0.50 | A216 |
+| kind icon strokes / accent | 0.30 | A213 |
+| distance text | 0.08 | A244 |
+| quest label | 0.00 | A255 (A249 … A253 while a marker moves, sub-pixel resampling) |
+
+A flat 1:1 fade would wash the text out before the background becomes
+see-through, so text and outlines are deliberately protected. `op = 1.0`
+(the default, and what a plugin older than this change sends) reproduces the
+previous look pixel for pixel. Below `op = 0.01` a marker is dropped instead of
+drawn invisibly, and hostile config values are clamped on both sides.
+
+Measured on KWin/KDE with the Wayland presenter, covered and above native
+resolution. On a compositor that blends layer surfaces differently the result
+can look washed out — raise the opacity or set `markerAlpha` back to 1.0.
+Cost at default opacity is unmeasurable (2.80 → 2.81 ms per frame at 64
+markers); rendering while translucent costs about 20 % more of that frame time,
+and the wire grows by ~9 bytes per marker per frame.
 
 ### Command line
 
@@ -319,6 +350,7 @@ placeholder `config.example.json` is tracked.
 | Labels in a boring font | Chakra Petch not installed | install it or set `"font": ""` |
 | Markers freeze on screen | feed went quiet > 1 s | expected: the overlay clears itself; check the game/plugin log |
 | Feed works, markers jitter | very low game FPS | the smoother interpolates real measurements; lower `hz` rarely helps, see [Under the hood](#under-the-hood) |
+| Markers look washed out or too faint | `Marker Opacity` / `markerAlpha` lowered, or a compositor that blends layer surfaces differently | set both back to 1.0; the tier table is in [semi-transparent markers](#semi-transparent-markers) |
 
 Still stuck? `--debug` gives per-frame stats, `--trace out.jsonl` gives every
 raw frame — that is enough to tell a feed problem from a drawing problem.
@@ -400,6 +432,8 @@ Everything is a plain script with a `RESULT:` line — no pytest, no fixtures:
 .venv/bin/python3 tests/test_plugin_ws.py        # the REAL C# server (needs dotnet)
 .venv/bin/python3 tests/test_feed_hardening.py   # sanitizer, caps, log masking
 .venv/bin/python3 tests/test_frame_rects.py      # geometry
+.venv/bin/python3 tests/test_alpha.py            # opacity tiers, hostile values
+.venv/bin/python3 tests/test_plugin_labels.py    # objective index (needs dotnet)
 .venv/bin/python3 tests/test_smooth.py           # interpolation
 ```
 

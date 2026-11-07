@@ -67,6 +67,9 @@ jobs:
           python tests/test_frame_rects.py
           python tests/test_smooth.py
 
+      - name: Marker semi-transparency battery
+        run: python tests/test_alpha.py
+
       - name: Presenter artifact checksums
         run: |
           sha256sum wayland/wayland_present | tee presenter.sha256

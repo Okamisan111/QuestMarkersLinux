@@ -42,6 +42,7 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
     private ConfigEntry<bool> imperialUnits;
     private ConfigEntry<int> edgeArrowSize;
     private ConfigEntry<float> iconScale;
+    private ConfigEntry<float> markerOpacity;
     private ConfigEntry<bool> debugLog;
 
     private BridgeScanner scanner;
@@ -113,6 +114,13 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
         iconScale = Config.Bind("Display", "Icon Scale", 1.0f,
             Tagged("Icon Scale", 35, "Size multiplier of the symbol (pin and kind icon).",
                 new AcceptableValueRange<float>(0.2f, 5f), true));
+        markerOpacity = Config.Bind("Display", "Marker Opacity", 1.0f,
+            Tagged("Marker Opacity", 38, "How see-through the markers are (1.0 = fully opaque, 0.05 = watermark). "
+                + "Lowering it opens up the tagbox background and the pin fill only: the gold outlines, the quest "
+                + "label and the meter keep most of their opacity, so a marker stays readable over bright ground "
+                + "(snow, sand, concrete). The overlay multiplies this by its own 'markerAlpha' in config.json, so "
+                + "both sides can dim the same marker. Semi-transparency was measured on KWin/KDE; on another "
+                + "compositor the blending can come out slightly washed."));
         debugLog = Config.Bind("Debug", "Debug Log", false,
             Tagged("Debug Log", 100, "Verbose bridge logging: scan results, frame stats, feed client state - written into the BepInEx log.", null, true));
 
@@ -270,13 +278,22 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
     /// nx/ny are normalized viewport coords (0..1 on-screen; off-screen values leave
     /// the range and already point toward the correct edge, y top-down); markers
     /// behind the camera are mirrored so nx/ny point to the matching screen edge,
-    /// b=1 marks them. d is meters. Edge arrows are derived by the overlay
-    /// (cfg "edge"), not emitted by the game side. cfg mirrors the Display config.
+    /// b=1 marks them. d is meters. op is the Display setting "Marker Opacity"
+    /// (0.05..1, written as the bare integer 1 while it is untouched) - the overlay
+    /// turns it into per-layer alphas, see ALPHA_WEIGHTS there. Edge arrows are
+    /// derived by the overlay (cfg "edge"), not emitted by the game side. cfg mirrors
+    /// the Display config.
     private void BuildFrame(StringBuilder sb, IReadOnlyList<MarkerTarget> targets)
     {
         Camera camera = CameraManager.Exist ? CameraManager.Instance.Camera : null;
         int w = Screen.width;
         int h = Screen.height;
+        // "Marker Opacity" resolved once per frame (a config read per marker would
+        // be 32 reads per frame for nothing): clamped to the same range the config
+        // entry allows, so a hand-edited cfg can never send op 0 or 7.
+        float frameOpacity = markerOpacity.Value;
+        if (!IsFinite(frameOpacity)) frameOpacity = 1f;
+        frameOpacity = Math.Max(0.05f, Math.Min(1f, frameOpacity));
         StringBuilder mJson = new StringBuilder(2048);
         StringBuilder mFrag = new StringBuilder(160);
         // The frame HEAD is written UNCONDITIONALLY. Idle frames (targets ==
@@ -380,7 +397,13 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
                     .Append(nx.ToString("F4", CultureInfo.InvariantCulture))
                     .Append(",\"ny\":").Append(ny.ToString("F4", CultureInfo.InvariantCulture))
                     .Append(",\"b\":").Append(behind ? 1 : 0)
-                    .Append(",\"op\":1,\"l\":");
+                    // op = this frame's Marker Opacity. The default 1.0 is written
+                    // as the bare integer, so the wire stays byte-identical for
+                    // every setup that never touched the knob and only a lowered
+                    // opacity costs bytes.
+                    .Append(",\"op\":").Append(frameOpacity >= 0.999f
+                        ? "1"
+                        : frameOpacity.ToString("F2", CultureInfo.InvariantCulture)).Append(",\"l\":");
                 AppendJsonString(mFrag, t.Label != null && t.Label.Length > 120
                     ? t.Label.Substring(0, 119) + "\u2026" : t.Label);
                 mFrag.Append(",\"d\":").Append((int)Math.Round(visible[i].dist));
