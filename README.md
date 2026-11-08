@@ -37,7 +37,7 @@ idea, rebuilt for Linux.
 
 ![Quest markers in a raid: translucent tags with quest names and distances, plus edge arrows for off-screen targets](docs/example.webp)
 
-**Now with transparency and multi-Monitor support!**
+**Now with transparency and multi-monitor support!**
 
 *In a raid: off-screen objectives appear as arrows at the screen edge, visible
 ones as pins with name and distance.*
