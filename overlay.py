@@ -1825,8 +1825,210 @@ def make_feed_provider(path, trace_path=None, feed_token=""):
     return get
 
 
+# ---------------------------------------------------------------------------
+# Which monitor? (multi-monitor setups pick the screen, the overlay follows)
+# ---------------------------------------------------------------------------
+
+MONITOR_AUTO = ("", "auto", "default")   # specs that mean "you decide"
+
+
+def _int_field(value, fallback):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _text_field(value, cap):
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:cap]   # collapse tabs/newlines a monitor name could carry
+
+
+def probe_monitors(presenter=None, runner=None):
+    """Ask the presenter for the connected monitors (one dict per wl_output).
+
+    The presenter enumerates the compositor's outputs in registry order and
+    the same order is what "#index" means later, so a probe and the surface
+    agree. An empty list is a legitimate answer: no Wayland session, a
+    presenter built before this feature, or a compositor that lists nothing.
+    """
+    path = presenter or PRESENTER
+    run = runner if runner is not None else subprocess.run
+    if not os.path.exists(path):
+        return []
+    try:
+        done = run([path, "--list"], capture_output=True, timeout=8)
+    except Exception as e:
+        print(f"monitor probe failed: {e}")
+        return []
+    monitors = []
+    for i, raw in enumerate((done.stdout or b"").decode(errors="replace").splitlines()):
+        raw = raw.strip()
+        if not raw.startswith("{"):
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        monitors.append({
+            "index": _int_field(row.get("index"), i),
+            "name": _text_field(row.get("name"), 128),
+            "description": _text_field(row.get("description"), 256),
+            "x": _int_field(row.get("x"), 0),
+            "y": _int_field(row.get("y"), 0),
+            "width": max(0, _int_field(row.get("width"), 0)),
+            "height": max(0, _int_field(row.get("height"), 0)),
+            "scale": max(1, _int_field(row.get("scale"), 1)),
+            "refresh_mhz": max(0, _int_field(row.get("refresh_mhz"), 0)),
+        })
+    return monitors
+
+
+def monitor_label(m):
+    """One human-readable line per monitor, as shown on the prompt."""
+    name = (m.get("name") or m.get("description") or "unnamed output").strip()
+    w, h = m.get("width") or 0, m.get("height") or 0
+    size = f"{w}x{h}" if w and h else "size unknown"
+    parts = [name, f"{size}+{m.get('x', 0)}+{m.get('y', 0)}"]
+    if m.get("scale", 1) != 1:
+        parts.append(f"scale {m['scale']}")
+    # 179960 mHz is sold as 180 Hz; printing 179 would make a user doubt the list
+    hz = round((m.get("refresh_mhz") or 0) / 1000.0)
+    if hz:
+        parts.append(f"{hz} Hz")
+    return "  ".join(parts)
+
+
+def monitor_choice(m):
+    """What the user (and the presenter argv) should use for this monitor.
+
+    A real wl_output name is the durable pick: connector names survive a
+    replug and a rearranged layout, x offsets do not. Compositors that send no
+    name at all (KWin does not send one) are picked by their probe index.
+    """
+    name = (m.get("name") or "").strip()
+    return name if name else f"#{m.get('index', 0)}"
+
+
+def resolve_monitor(monitors, spec):
+    """Match one spec ("DP-1", "1"/"#1", "1280,0", a description fragment).
+
+    Returns the monitor dict, or a human-readable 'what went wrong' string -
+    the caller exits on that instead of guessing a screen.
+    """
+    spec = str(spec).strip()
+    if not spec:
+        return "empty monitor spec"
+    bare = spec[1:] if spec.startswith("#") else spec
+
+    if bare.isdigit():                      # "1" and "#1" mean the same pick
+        for m in monitors:
+            if m["index"] == int(bare):
+                return m
+        return (f"no monitor {spec} (known: "
+                + ", ".join(monitor_choice(m) for m in monitors) + ")")
+
+    pos = re.match(r"^(-?\d+),(-?\d+)$", spec)
+    if pos:
+        x, y = int(pos.group(1)), int(pos.group(2))
+        hits = [m for m in monitors if m["x"] == x and m["y"] == y]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            return (f"position {spec} matches {len(hits)} monitors - use the "
+                    "number instead")
+        return f"no monitor at position {spec}"
+
+    low = spec.lower()
+    hits = [m for m in monitors if m["name"].lower() == low]
+    if not hits:
+        hits = [m for m in monitors if m["description"].lower() == low]
+    if not hits:
+        hits = [m for m in monitors
+                if low in m["name"].lower() or low in m["description"].lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        return (f"no monitor matching {spec!r} (known: "
+                + ", ".join(monitor_choice(m) for m in monitors) + ")")
+    return (f"{spec!r} matches {len(hits)} monitors: "
+            + ", ".join(monitor_choice(m) for m in hits))
+
+
+def choose_monitor(monitors, wanted=None, interactive=False, prompt=None,
+                   say=print, attempts=3):
+    """Decide which monitor the overlay belongs on.
+
+    Returns {"monitor": dict|None, "selector": str|None, "error": str|None,
+    "asked": bool}. monitor None means "no pick, let the compositor decide".
+    error is only ever set for an explicit spec that matches nothing: drawing
+    on the wrong screen because of a typo is worse than refusing to start.
+    """
+    ask = prompt if prompt is not None else input
+    out = {"monitor": None, "selector": None, "error": None, "asked": False}
+
+    def take(m, why):
+        out["monitor"] = m
+        out["selector"] = monitor_choice(m)
+        say(f"monitor: {monitor_label(m)} ({why})")
+        return out
+
+    if not monitors:
+        say("monitor: the compositor gave no monitor list - using the "
+            "compositor default output")
+        return out
+
+    spec = "" if wanted is None else str(wanted).strip()
+    if spec.lower() in MONITOR_AUTO:
+        spec = ""
+
+    if spec:
+        picked = resolve_monitor(monitors, spec)
+        if isinstance(picked, dict):
+            return take(picked, f"selected by {spec!r}")
+        out["error"] = picked
+        say(f"monitor: {picked}")
+        return out
+
+    if len(monitors) == 1:
+        return take(monitors[0], "the only monitor")
+
+    if not interactive:
+        say(f"{len(monitors)} monitors detected, no monitor asked for: using the "
+            "compositor default output. Pin one with --monitor "
+            f"{monitor_choice(monitors[0])} (or \"monitor\": "
+            f"\"{monitor_choice(monitors[0])}\" in config.json) - "
+            + " | ".join(monitor_label(m) for m in monitors))
+        return out
+
+    say(f"{len(monitors)} monitors detected:")
+    for m in monitors:
+        say(f"  [{monitor_choice(m)}] {monitor_label(m)}")
+    out["asked"] = True
+    for _ in range(max(1, attempts)):
+        try:
+            answer = ask("Which monitor should the overlay use? "
+                         "[number, name or x,y - Enter = first one]: ")
+        except (EOFError, KeyboardInterrupt):
+            say("monitor: no answer - using the compositor default output")
+            return out
+        answer = (answer or "").strip()
+        if not answer:
+            return take(monitors[0], "answered with Enter")
+        picked = resolve_monitor(monitors, answer)
+        if isinstance(picked, dict):
+            return take(picked, "chosen on the prompt")
+        say(f"  not a monitor: {picked}")
+    say(f"monitor: no valid answer after {attempts} tries - using the "
+        "compositor default output")
+    return out
+
+
 def run_wayland_feed(path, seconds, hz, smooth, W, H, out_x, debug=False,
-                     trace=None, feed_token=""):
+                     trace=None, feed_token="", monitor_selector=None):
     """Feed ARGB frames to the native Wayland layer-shell presenter.
 
     KWin blends the alpha channel of a layer-shell surface, so this is the
@@ -1841,8 +2043,12 @@ def run_wayland_feed(path, seconds, hz, smooth, W, H, out_x, debug=False,
     surface_size = [None]  # type: list  # live layer surface (w, h), updated on reconfigure
 
     def spawn():
-        p = subprocess.Popen([PRESENTER, str(W), str(H), str(out_x)],
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        # Fourth argument is the monitor selector ("DP-1", "#1", "1280,0").
+        # Without one the presenter keeps its legacy x-offset behaviour.
+        argv = [PRESENTER, str(W), str(H), str(out_x)]
+        if monitor_selector:
+            argv.append(str(monitor_selector))
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         assert p.stdout is not None
 
         def note(text):
@@ -2009,6 +2215,17 @@ def main():
     p.add_argument("--smooth", type=float, default=None,
                    help="EMA smoothing time constant in seconds "
                         "(0 = off, larger = smoother, no steady-state lag)")
+    p.add_argument("--monitor", default=None, metavar="MONITOR",
+                   help="Which screen to draw on: probe index ('1' or '#1'), "
+                        "wl_output name ('DP-1'), a description fragment "
+                        "('ULTRAGEAR') or a layout position ('1280,0'). With "
+                        "several monitors and no --monitor, the overlay asks "
+                        "once; without a terminal it uses the compositor "
+                        "default. overlay.py --list-monitors prints them.")
+    p.add_argument("--list-monitors", action="store_true",
+                   help="Print what the compositor reports (one line per "
+                        "monitor, with the value to pass as --monitor) and "
+                        "exit.")
     args = p.parse_args()
     # config.json supplies defaults; explicit CLI flags win over it. The
     # default path is anchored to overlay.py's OWN directory (launch CWD
@@ -2033,7 +2250,17 @@ def main():
         hz_val = clamped
     args.hz = hz_val
     args.smooth = _finite(args.smooth if args.smooth is not None else cfg.get("smooth", 0.6), 0.6)
+    args.monitor = args.monitor if args.monitor is not None else cfg.get("monitor")
     args.feed_token = args.feed_token if args.feed_token is not None else cfg.get("feedToken", "")
+    if args.list_monitors:
+        found = probe_monitors()
+        if not found:
+            print("no monitor reported: no Wayland session, or a presenter "
+                  "binary built before this feature (bash wayland/build.sh)")
+            return 1
+        for m in found:
+            print(f"[{monitor_choice(m)}] {monitor_label(m)}")
+        return 0
     if args.feed and args.feed.startswith("file://"):
         args.feed = args.feed[len("file://"):]  # accepted scheme == plain path
     if args.feed and args.feed.startswith("ws://"):
@@ -2065,14 +2292,33 @@ def main():
         return 2
     sys.stdout = _Tee(sys.stdout, LOG_PATH)
 
+    # Which screen? Ask the compositor once. A monitor the user named wins;
+    # several screens without a named one ask the user (a terminal), or fall
+    # back to the compositor default (a launcher, a service, CI) instead of
+    # blocking on a prompt nobody can answer there.
+    monitors = probe_monitors()
+    picked = choose_monitor(monitors, args.monitor,
+                            interactive=sys.stdin.isatty())
+    if picked["error"]:
+        print("pick a real monitor: --monitor <number|name|x,y> "
+              "(overlay.py --list-monitors prints what is available)")
+        return 2
+    mon = picked["monitor"]
+
     if args.geometry:
         W, H, X, _ = parse_geometry(args.geometry)
+    elif mon and mon["width"] > 0 and mon["height"] > 0:
+        # the chosen screen's own size: the old hardcoded 2560x1440 frame
+        # overshot a 1920x1080 second monitor by the whole difference
+        W, H, X = mon["width"], mon["height"], mon["x"]
     else:
         W, H, X, _ = 2560, 1440, 0, 0  # primary display, fullscreen (single-monitor default)
-    print(f"presenter: wayland layer-shell {W}x{H}, output x={X}")
+    sel = picked["selector"]
+    print(f"presenter: wayland layer-shell {W}x{H}, "
+          + (f"monitor {sel}" if sel else f"output x={X}"))
     return run_wayland_feed(args.feed, args.seconds, args.hz, args.smooth,
                             W, H, X, debug=args.debug, trace=args.trace,
-                            feed_token=args.feed_token)
+                            feed_token=args.feed_token, monitor_selector=sel)
 
 if __name__ == "__main__":
     try:

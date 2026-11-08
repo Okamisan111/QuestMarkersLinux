@@ -232,6 +232,7 @@ repository on purpose — it carries your feed token.
 | `markerAlpha` | 1.0 | overlay-side dimmer, multiplies the plugin's `Marker Opacity` |
 | `imperial` | false | feet/miles |
 | `geometry` | null | override the surface placement |
+| `monitor` | null | which screen to draw on — same four forms as `--monitor` |
 | `feedToken` | — | shared secret, must equal the plugin's `Feed Token` |
 
 The file is read once at overlay start. A UTF-8 BOM is fine; a broken file
@@ -272,6 +273,41 @@ Cost at default opacity is unmeasurable (2.80 → 2.81 ms per frame at 64
 markers); rendering while translucent costs about 20 % more of that frame time,
 and the wire grows by ~9 bytes per marker per frame.
 
+### Two screens, one overlay: picking the monitor
+
+`wayland_present --list` now asks the compositor for every connected output and
+`overlay.py` reads that list once at startup. What it does with it depends on
+how many screens there are:
+
+| Situation | Behaviour |
+|---|---|
+| one monitor | uses it, no question asked (single-monitor setups behave exactly as before) |
+| several monitors, no setting | asks once, in the terminal it was started from: `[0] … [1] …`, answer with a number, a name or a position; Enter takes the first one |
+| several monitors, started without a terminal (Lutris, a .desktop launcher, a service, CI) | never blocks on a prompt: uses the compositor default output and prints which screens exist plus the value to pin |
+| a monitor named that does not exist | refuses to start and prints the real list — a typo must not draw markers on the wrong screen |
+
+Pin the screen with `--monitor` (or `"monitor"` in `config.json`). Four forms
+work, and they are exactly what `overlay.py --list-monitors` prints:
+
+```bash
+overlay.py --list-monitors             # what is connected, and what to type
+overlay.py --feed ws://127.0.0.1:9378 --monitor 1          # probe index
+overlay.py --feed ws://127.0.0.1:9378 --monitor DP-1       # wl_output name
+overlay.py --feed ws://127.0.0.1:9378 --monitor ULTRAGEAR  # description fragment
+overlay.py --feed ws://127.0.0.1:9378 --monitor 2560,0     # layout position
+```
+
+KWin sends no `wl_output` name at all, so on KDE the useful values are the
+probe index (`--list-monitors` shows `[#0] …`) or a fragment of the monitor's
+description (`ULTRAGEAR`, `24G2`). A compositor that reports connector names
+(wlroots-based ones) can be pinned by name, which survives a replug — layout
+offsets do not.
+
+The surface size follows the chosen screen. The old hardcoded 2560×1440 frame
+overshot a 1920×1080 second monitor by the whole difference; now the overlay
+asks the monitor how big it is, and `geometry` stays available as an explicit
+override.
+
 ### Command line
 
 | Flag | Purpose |
@@ -279,6 +315,8 @@ and the wire grows by ~9 bytes per marker per frame.
 | `--feed URL_OR_FILE` | feed source |
 | `--config PATH` | alternate config file |
 | `--geometry WxH+X+Y` | surface placement (default fullscreen at 0,0) |
+| `--monitor SPEC` | which screen to draw on: `1` / `#1`, `DP-1`, `ULTRAGEAR` or `2560,0` |
+| `--list-monitors` | print what the compositor reports and exit |
 | `--hz N` | render rate |
 | `--smooth S` | seam blending |
 | `--debug` | per-frame feed stats every 2 s |
@@ -351,6 +389,7 @@ placeholder `config.example.json` is tracked.
 | Markers freeze on screen | feed went quiet > 1 s | expected: the overlay clears itself; check the game/plugin log |
 | Feed works, markers jitter | very low game FPS | the smoother interpolates real measurements; lower `hz` rarely helps, see [Under the hood](#under-the-hood) |
 | Markers look washed out or too faint | `Marker Opacity` / `markerAlpha` lowered, or a compositor that blends layer surfaces differently | set both back to 1.0; the tier table is in [semi-transparent markers](#semi-transparent-markers) |
+| Markers appear on the wrong monitor | several outputs and no monitor pinned | `overlay.py --list-monitors`, then `--monitor` (or `monitor` in `config.json`) with the value it prints |
 
 Still stuck? `--debug` gives per-frame stats, `--trace out.jsonl` gives every
 raw frame — that is enough to tell a feed problem from a drawing problem.
@@ -433,6 +472,7 @@ Everything is a plain script with a `RESULT:` line — no pytest, no fixtures:
 .venv/bin/python3 tests/test_feed_hardening.py   # sanitizer, caps, log masking
 .venv/bin/python3 tests/test_frame_rects.py      # geometry
 .venv/bin/python3 tests/test_alpha.py            # opacity tiers, hostile values
+.venv/bin/python3 tests/test_monitor.py            # monitor probe, picking, prompt
 .venv/bin/python3 tests/test_plugin_labels.py    # objective index (needs dotnet)
 .venv/bin/python3 tests/test_smooth.py           # interpolation
 ```

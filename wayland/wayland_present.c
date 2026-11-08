@@ -9,8 +9,13 @@
  * on XCreateWindow) and shape-clipped X11 windows stay opaque black outside
  * the clip, so real per-pixel alpha needs a native Wayland surface.
  *
- * usage: wayland_present WIDTH HEIGHT OUTPUT_X
+ * usage: wayland_present WIDTH HEIGHT [OUTPUT_X] [SELECTOR]
  *        OUTPUT_X < 0 -> compositor default output
+ *        SELECTOR picks the monitor: "#1" = --list index, "1280,0" = layout
+ *        position, anything else = wl_output name or a fragment of its
+ *        description ("DP-1", "ULTRAGEAR"). It wins over OUTPUT_X. Compositors
+ *        that send no wl_output name (KWin does not) are picked by index.
+ *        wayland_present --list -> one JSON line per monitor, then exit
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -18,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -31,8 +37,13 @@
 
 struct output {
     struct wl_output *output;
-    int32_t x, y, w, h;
+    int32_t x, y, w, h;      /* x/y: layout position, w/h: current mode */
+    int32_t scale;
+    int32_t refresh;         /* mHz of the current mode */
+    char name[64];           /* wl_output name (v2): "DP-1", "eDP-1", ... */
+    char description[128];   /* wl_output description, else "make model" */
     int have_geometry;
+    int done;                /* compositor finished describing this output */
 };
 
 struct state {
@@ -46,7 +57,10 @@ struct state {
 
     struct output outputs[MAX_OUTPUTS];
     int n_outputs;
-    int want_x;
+    int want_x;          /* legacy: match by layout x offset */
+    int want_index;      /* #N: match by --list enumeration index */
+    int want_gx, want_gy, want_geo;  /* "x,y": match by layout position */
+    char want_name[128]; /* name, or a case-insensitive description fragment */
 
     struct wl_buffer *buf[NBUFS];
     unsigned char *data[NBUFS];
@@ -254,41 +268,58 @@ static void output_geometry(void *data, struct wl_output *output, int32_t x,
                             int32_t transform)
 {
     (void)output;
-    (void)pw;
+    (void)pw;   /* physical size: useless for picking, the mode tells the truth */
     (void)ph;
     (void)subpixel;
-    (void)make;
-    (void)model;
     (void)transform;
     struct output *o = data;
     o->x = x;
     o->y = y;
     o->have_geometry = 1;
+    /* fallback label until (and unless) a wl_output description arrives */
+    if (o->description[0] == '\0' && make && make[0])
+        snprintf(o->description, sizeof(o->description), "%s %s",
+                 make, model ? model : "");
 }
 
 static void output_mode(void *data, struct wl_output *output, uint32_t flags,
                         int32_t w, int32_t h, int32_t refresh)
 {
     (void)output;
-    (void)refresh;
     struct output *o = data;
     if (flags & WL_OUTPUT_MODE_CURRENT) {
         o->w = w;
         o->h = h;
+        o->refresh = refresh;
     }
 }
 
 static void output_done(void *data, struct wl_output *output)
 {
-    (void)data;
     (void)output;
+    ((struct output *)data)->done = 1;
 }
 
 static void output_scale(void *data, struct wl_output *output, int32_t factor)
 {
-    (void)data;
     (void)output;
-    (void)factor;
+    ((struct output *)data)->scale = factor > 0 ? factor : 1;
+}
+
+/* wl_output v2 events: the stable identity the user picks a monitor by */
+static void output_name(void *data, struct wl_output *output, const char *name)
+{
+    (void)output;
+    struct output *o = data;
+    snprintf(o->name, sizeof(o->name), "%s", name ? name : "");
+}
+
+static void output_description(void *data, struct wl_output *output,
+                               const char *desc)
+{
+    (void)output;
+    struct output *o = data;
+    snprintf(o->description, sizeof(o->description), "%s", desc ? desc : "");
 }
 
 static const struct wl_output_listener output_listener = {
@@ -296,6 +327,8 @@ static const struct wl_output_listener output_listener = {
     .mode = output_mode,
     .done = output_done,
     .scale = output_scale,
+    .name = output_name,
+    .description = output_description,
 };
 
 static void registry_global(void *data, struct wl_registry *registry,
@@ -337,9 +370,128 @@ static const struct wl_registry_listener registry_listener = {
     .global_remove = registry_global_remove,
 };
 
+static int o_strcasecmp(const char *a, const char *b)
+{
+    if (!a || !b || !a[0] || !b[0])
+        return 1;              /* an unnamed output is not the one asked for */
+    return strcasecmp(a, b);
+}
+
+static void json_escape(const char *src, char *dst, size_t n)
+{
+    size_t j = 0;
+    if (!src || n < 3) { if (n) dst[0] = '\0'; return; }
+    for (const unsigned char *p = (const unsigned char *)src;
+         *p && j + 2 < n; p++) {
+        unsigned char c = *p;
+        if (c == '"' || c == '\\') { dst[j++] = '\\'; dst[j++] = (char)c; }
+        else if (c == '\n' || c == '\r' || c == '\t') {
+            dst[j++] = '\\';
+            dst[j++] = c == '\n' ? 'n' : (c == '\r' ? 'r' : 't');
+        } else if (c < 0x20) {
+            j += (size_t)snprintf(dst + j, n - j, "\\u%04x", c);
+        } else {
+            dst[j++] = (char)c;   /* UTF-8 monitor names pass through */
+        }
+    }
+    dst[j] = '\0';
+}
+
+static void log_outputs(void)
+{
+    for (int i = 0; i < st.n_outputs; i++) {
+        struct output *o = &st.outputs[i];
+        fprintf(stderr, "output[%d]: name=%s desc=%s %dx%d%+d%+d scale=%d\n",
+                i, o->name[0] ? o->name : "(none)",
+                o->description[0] ? o->description : "(none)",
+                o->w, o->h, o->x, o->y, o->scale);
+    }
+}
+
+static void print_outputs_json(void)
+{
+    for (int i = 0; i < st.n_outputs; i++) {
+        struct output *o = &st.outputs[i];
+        char nm[160], ds[320];
+        json_escape(o->name, nm, sizeof(nm));
+        json_escape(o->description, ds, sizeof(ds));
+        printf("{\"index\":%d,\"name\":\"%s\",\"description\":\"%s\",\"x\":%d,"
+               "\"y\":%d,\"width\":%d,\"height\":%d,\"scale\":%d,"
+               "\"refresh_mhz\":%d,\"done\":%d}\n",
+               i, nm, ds, o->x, o->y, o->w, o->h, o->scale > 0 ? o->scale : 1,
+               o->refresh, o->done ? 1 : 0);
+    }
+    fflush(stdout);
+}
+
+static int desc_match(const char *desc, const char *sel)
+{
+    if (!desc || !desc[0] || !sel || !sel[0])
+        return 0;
+    return strcasestr(desc, sel) != NULL;
+}
+
 static void pick_output(void)
 {
     st.target = NULL;
+    int i;
+
+    /* An index is what the Python side falls back to when the compositor
+     * sends no monitor name, and it refers to the very same enumeration it
+     * just read from --list in this Wayland session. */
+    if (st.want_index >= 0) {
+        if (st.want_index < st.n_outputs) {
+            st.target = st.outputs[st.want_index].output;
+            fprintf(stderr, "output: index %d (%s %dx%d%+d%+d)\n",
+                    st.want_index,
+                    st.outputs[st.want_index].name[0]
+                        ? st.outputs[st.want_index].name
+                        : (st.outputs[st.want_index].description[0]
+                           ? st.outputs[st.want_index].description : "unnamed"),
+                    st.outputs[st.want_index].w, st.outputs[st.want_index].h,
+                    st.outputs[st.want_index].x, st.outputs[st.want_index].y);
+            return;
+        }
+        fprintf(stderr, "output: no monitor at index %d (%d seen)\n",
+                st.want_index, st.n_outputs);
+        log_outputs();
+        fprintf(stderr, "output: falling back to the compositor default\n");
+        return;
+    }
+    if (st.want_geo) {
+        for (i = 0; i < st.n_outputs; i++) {
+            if (st.outputs[i].have_geometry && st.outputs[i].x == st.want_gx
+                && st.outputs[i].y == st.want_gy) {
+                st.target = st.outputs[i].output;
+                fprintf(stderr, "output: position %d,%d (index %d)\n",
+                        st.want_gx, st.want_gy, i);
+                return;
+            }
+        }
+        fprintf(stderr, "output: no monitor at %d,%d\n", st.want_gx, st.want_gy);
+        log_outputs();
+        fprintf(stderr, "output: falling back to the compositor default\n");
+        return;
+    }
+
+    /* A monitor name beats an x offset: the layout offset changes the moment
+     * someone plugs in or rearranges a screen, the connector name does not. */
+    if (st.want_name[0]) {
+        for (int i = 0; i < st.n_outputs; i++) {
+            if (o_strcasecmp(st.outputs[i].name, st.want_name) == 0
+                || desc_match(st.outputs[i].description, st.want_name)) {
+                st.target = st.outputs[i].output;
+                fprintf(stderr, "output: name %s (index %d, %dx%d%+d%+d)\n",
+                        st.outputs[i].name, i, st.outputs[i].w,
+                        st.outputs[i].h, st.outputs[i].x, st.outputs[i].y);
+                return;
+            }
+        }
+        fprintf(stderr, "output: no monitor named %s\n", st.want_name);
+        log_outputs();
+        fprintf(stderr, "output: falling back to the compositor default\n");
+        return;
+    }
     if (st.want_x < 0) {
         fprintf(stderr, "output: compositor default\n");
         return;
@@ -351,30 +503,72 @@ static void pick_output(void)
             return;
         }
     }
-    fprintf(stderr, "output: no output at x=%d, using compositor default\n",
-            st.want_x);
+    fprintf(stderr, "output: no output at x=%d\n", st.want_x);
+    log_outputs();
+    fprintf(stderr, "output: falling back to the compositor default\n");
 }
 
 int main(int argc, char **argv)
 {
-    if (argc < 4) {
-        fprintf(stderr, "usage: %s WIDTH HEIGHT OUTPUT_X\n", argv[0]);
+    int list_only = (argc >= 2 && strcmp(argv[1], "--list") == 0);
+    if (!list_only && argc < 3) {
+        fprintf(stderr, "usage: %s WIDTH HEIGHT [OUTPUT_X] [OUTPUT_NAME]\n"
+                        "       %s --list\n", argv[0], argv[0]);
         return 2;
     }
-    st.width = atoi(argv[1]);
-    st.height = atoi(argv[2]);
-    st.want_x = atoi(argv[3]);
-    st.cur = 0;
 
     st.dpy = wl_display_connect(NULL);
     if (!st.dpy) {
         fprintf(stderr, "cannot connect to Wayland display\n");
-        return 1;
+        return list_only ? 3 : 1;
     }
     struct wl_registry *registry = wl_display_get_registry(st.dpy);
     wl_registry_add_listener(registry, &registry_listener, NULL);
     wl_display_roundtrip(st.dpy); /* globals */
-    wl_display_roundtrip(st.dpy); /* output geometry */
+    wl_display_roundtrip(st.dpy); /* output geometry/mode/name/description */
+    /* A compositor that batches its output state can still be mid-batch
+     * after two roundtrips; one more is cheap and makes --list complete. */
+    if (list_only && st.n_outputs) {
+        for (int pass = 0; pass < 6; pass++) {
+            int pending = 0;
+            for (int i = 0; i < st.n_outputs; i++)
+                if (!st.outputs[i].done)
+                    pending++;
+            if (!pending)
+                break;
+            if (wl_display_roundtrip(st.dpy) < 0)
+                break;
+        }
+        print_outputs_json();
+        wl_display_disconnect(st.dpy);
+        return st.n_outputs ? 0 : 3;
+    }
+    if (list_only) {
+        fprintf(stderr, "no wl_output globals on this display\n");
+        wl_display_disconnect(st.dpy);
+        return 3;
+    }
+
+    st.width = atoi(argv[1]);
+    st.height = atoi(argv[2]);
+    st.want_x = argc > 3 ? atoi(argv[3]) : -1;
+    st.want_index = -1;
+    if (argc > 4) {
+        const char *sel = argv[4];
+        const char *comma = strchr(sel, ',');
+        int consumed = 0;
+        if (sel[0] == '#') {
+            st.want_index = atoi(sel + 1);
+        } else if (comma
+                   && sscanf(sel, "%d,%d%n", &st.want_gx, &st.want_gy,
+                             &consumed) == 2
+                   && consumed == (int)strlen(sel)) {
+            st.want_geo = 1;
+        } else {
+            snprintf(st.want_name, sizeof(st.want_name), "%s", sel);
+        }
+    }
+    st.cur = 0;
 
     if (!st.compositor || !st.shm || !st.layer_shell) {
         fprintf(stderr, "missing compositor/shm/layer_shell globals\n");

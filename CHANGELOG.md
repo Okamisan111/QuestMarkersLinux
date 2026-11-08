@@ -25,8 +25,32 @@
   `op` stacking, cache buckets, edge arrows, and disjoint presenter footprints
   for the exact-memcpy damage control.
 
+### Added
+- **Multi-monitor support.** `wayland_present --list` reports every connected
+  output (index, wl_output name, description, layout position, mode, scale,
+  refresh) as one JSON line each, and `overlay.py` reads that list once at
+  startup. One monitor: used without a question. Several monitors: the overlay
+  asks once - `--monitor`, `monitor` in `config.json`, or an interactive prompt
+  that accepts a number, a name, a description fragment or an `x,y` position
+  (Enter = the first one). Started without a terminal it never blocks on a
+  prompt: it uses the compositor default and prints the screens it found plus
+  the value to pin. A monitor spec that matches nothing aborts with the real
+  list instead of drawing on the wrong screen. The surface size follows the
+  chosen monitor instead of a hardcoded 2560x1440, and the presenter picks the
+  output by index, position or name (`#1`, `1280,0`, `DP-1`, `ULTRAGEAR`) while
+  the legacy x-offset call keeps working. KWin sends no wl_output name at all,
+  which is why index and description matching exist.
+- New battery `tests/test_monitor.py`: `--list` JSON parsing with hostile rows
+  (400-character names, tabs and newlines in descriptions, negative sizes,
+  string numbers), the wire shape pinned against the presenter's own printf
+  format, every spec form, ambiguous and unknown specs, when the prompt is and
+  is not asked, every prompt answer (number, name, position, Enter, garbage,
+  EOF, Ctrl-C), and the presenter argv with and without a monitor.
+
 ### Performance
-- Default opacity: 2.80 → 2.81 ms per frame (64 markers, 1280×720, render +
+- Startup runs the presenter once more for the monitor probe (`--list`, one
+  process, ~30 ms); nothing on the per-frame path changed.
+- Default opacity: 2.80 -> 2.81 ms per frame (64 markers, 1280×720, render +
   merge) — no measurable regression. Rendering while translucent costs about
   19 % more of that frame time; the presenter path is unchanged.
 

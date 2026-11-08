@@ -70,6 +70,9 @@ jobs:
       - name: Marker semi-transparency battery
         run: python tests/test_alpha.py
 
+      - name: Multi-monitor battery
+        run: python tests/test_monitor.py
+
       - name: Presenter artifact checksums
         run: |
           sha256sum wayland/wayland_present | tee presenter.sha256
