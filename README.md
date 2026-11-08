@@ -35,7 +35,9 @@ gives you the quest-marker HUD you know from mods on Windows:
 It is a port inspired by **maschine's QuestMarkers** (MIT). Similar look, same
 idea, rebuilt for Linux.
 
-![Quest markers in a raid: pins with quest names and distances, plus edge arrows for off-screen targets](docs/example.webp)
+![Quest markers in a raid: translucent tags with quest names and distances, plus edge arrows for off-screen targets](docs/example.webp)
+
+**Now with transparency and multi-Monitor support!**
 
 *In a raid: off-screen objectives appear as arrows at the screen edge, visible
 ones as pins with name and distance.*
