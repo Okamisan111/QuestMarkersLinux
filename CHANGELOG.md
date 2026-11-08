@@ -1,11 +1,11 @@
 # Changelog
 
-## Unreleased
+## v1.2.2 — 2026-11-08
 
 ### Added
 - **Semi-transparent markers.** New plugin setting `Display / Marker Opacity`
-  (1.0 = opaque … 0.05 = watermark) and the overlay-side `markerAlpha` in
-  `config.json`; the two multiply. The overlay gives every part of a marker its
+  (0.05 … 1.0, default 0.35) and the overlay-side `markerAlpha` in `config.json`
+  (default 1.0); the two multiply. The overlay gives every part of a marker its
   own share of what is left (`ALPHA_WEIGHTS`, `layer alpha = 1 − (1 − opacity) ×
   weight`): the tagbox background and the pin fill open up, the 1 px outlines,
   the kind icon and the distance text stay mostly solid, the quest label never
@@ -15,17 +15,17 @@
   marker that moves, where sub-pixel anchoring resamples the glyph cores.
   Below `op = 0.01` a marker is dropped rather than drawn invisibly; hostile
   config values are clamped on the plugin side and sanitized on the overlay side.
-- The feed frame carries `"op":1` per marker. A bare integer while the setting
-  is untouched keeps the wire byte-identical for existing setups; only a lowered
-  opacity adds ~9 bytes per marker per frame (~17 KiB/s at 64 markers, 30 Hz).
+- The feed frame carries `op` per marker. `1` is written as a bare integer, so a
+  setup that raised the setting back to fully opaque - and any plugin older than
+  1.2.2, which sends no `op` at all - keeps a byte-identical wire. The 0.35
+  default writes `"op":"0.35"`, about 11 bytes per marker per frame (~26 KiB/s at
+  64 markers, 30 Hz).
 - New battery `tests/test_alpha.py`: tier arithmetic, premultiplied ARGB32
   expectations on the real components (plate, tagbox outline, pins, kind icon,
   label/distance text), composited markers at 1.0 / 0.45 / 0.16, hostile `op`
   values (0, negative, 1e9, inf, nan, strings, booleans), `markerAlpha` × wire
   `op` stacking, cache buckets, edge arrows, and disjoint presenter footprints
   for the exact-memcpy damage control.
-
-### Added
 - **Multi-monitor support.** `wayland_present --list` reports every connected
   output (index, wl_output name, description, layout position, mode, scale,
   refresh) as one JSON line each, and `overlay.py` reads that list once at
@@ -46,6 +46,19 @@
   format, every spec form, ambiguous and unknown specs, when the prompt is and
   is not asked, every prompt answer (number, name, position, Enter, garbage,
   EOF, Ctrl-C), and the presenter argv with and without a monitor.
+
+### Changed
+- **`Display / Marker Opacity` now defaults to 0.35** (was 1.0): a fresh install
+  ships translucent markers. By the tier weights that lands the tagbox plate and
+  the pin fill at A89, the outlines at A172, the kind icon at A205, the distance
+  text at A242 and the quest label at A255. Raise it to 1.0 for the previous
+  fully opaque look, which is also what a plugin older than 1.2.2 implies.
+  BepInEx keeps values an existing config already wrote, so an install that ran
+  1.2.1 once still reads `Marker Opacity = 1` until that entry is lowered or the
+  config file is deleted; the overlay's `markerAlpha` stays 1.0 so the shipped
+  look is the plugin value alone.
+- The wire's `op` field carries `0.35` instead of `1` for the default setting
+  (see the byte note above); only setups at exactly 1.0 keep the old bytes.
 
 ### Performance
 - Startup runs the presenter once more for the monitor probe (`--list`, one

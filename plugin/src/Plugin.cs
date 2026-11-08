@@ -19,7 +19,7 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
 {
     public const string PluginGuid = "com.chaossan.questmarkerslinux";
     public const string PluginName = "QuestMarkersLinux";
-    public const string PluginVersion = "1.2.1";
+    public const string PluginVersion = "1.2.2";
 
     private ConfigEntry<bool> bridgeOn;
     private ConfigEntry<KeyboardShortcut> toggleKey;
@@ -114,8 +114,8 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
         iconScale = Config.Bind("Display", "Icon Scale", 1.0f,
             Tagged("Icon Scale", 35, "Size multiplier of the symbol (pin and kind icon).",
                 new AcceptableValueRange<float>(0.2f, 5f), true));
-        markerOpacity = Config.Bind("Display", "Marker Opacity", 1.0f,
-            Tagged("Marker Opacity", 38, "How see-through the markers are (1.0 = fully opaque, 0.05 = watermark). "
+        markerOpacity = Config.Bind("Display", "Marker Opacity", 0.35f,
+            Tagged("Marker Opacity", 38, "How see-through the markers are (0.35 = default, 1.0 = fully opaque, 0.05 = watermark). "
                 + "Lowering it opens up the tagbox background and the pin fill only: the gold outlines, the quest "
                 + "label and the meter keep most of their opacity, so a marker stays readable over bright ground "
                 + "(snow, sand, concrete). The overlay multiplies this by its own 'markerAlpha' in config.json, so "
@@ -397,10 +397,12 @@ public class QuestMarkersLinuxPlugin : BaseUnityPlugin
                     .Append(nx.ToString("F4", CultureInfo.InvariantCulture))
                     .Append(",\"ny\":").Append(ny.ToString("F4", CultureInfo.InvariantCulture))
                     .Append(",\"b\":").Append(behind ? 1 : 0)
-                    // op = this frame's Marker Opacity. The default 1.0 is written
-                    // as the bare integer, so the wire stays byte-identical for
-                    // every setup that never touched the knob and only a lowered
-                    // opacity costs bytes.
+                    // op = this frame's Marker Opacity. A value of 1.0 is written
+                    // as the bare integer, which is what a plugin older than 1.2.2
+                    // implies (it sends no op at all) and what any setup that raised
+                    // the knob back to fully opaque gets: byte-identical wire. The
+                    // 0.35 default writes "op":"0.35" instead, about 11 bytes per
+                    // marker per frame (~26 KiB/s at 64 markers and 30 Hz).
                     .Append(",\"op\":").Append(frameOpacity >= 0.999f
                         ? "1"
                         : frameOpacity.ToString("F2", CultureInfo.InvariantCulture)).Append(",\"l\":");

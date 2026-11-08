@@ -100,8 +100,10 @@ EDGE_MAX_DIST = 250     # max px an edge arrow may sit away from the screen edge
 # plugin's in-game "Marker Opacity" arrives as the wire field "op", an
 # overlay-side "markerAlpha" (config.json) multiplies it. Each layer then keeps
 # its own share of what is left:  layer alpha = 1 - (1 - opacity) * ALPHA_WEIGHTS
-# So opacity 1.0 (the default, and the value a plugin older than 1.2.2 sends)
-# reproduces the fully opaque look pixel for pixel, while lowering it opens the
+# The plugin's default from 1.2.2 on is 0.35, so a fresh install ships
+# translucent: plate/pin A89, outlines A172, icon A205, distance A242, label
+# A255. 1.0 - what a plugin older than 1.2.2 sends, because it sends no "op" at
+# all - reproduces the fully opaque look pixel for pixel. Lowering it opens the
 # tagbox/pin background up but holds the outlines and text readable over bright
 # maps (snow, sand, concrete) - a flat 1:1 fade would wash the text out first.
 ALPHA_WEIGHTS = {
@@ -126,10 +128,12 @@ FEATURE_DEFAULTS = {
     "imperial": False,       # ImperialUnits: display feet / miles instead of m / km
     "smooth": 0.045,         # chord seam-blend time [s] (0 = raw feed);
                              # overlay-side only - not an in-game option
-    "markerAlpha": 1.0,      # 1.0 = fully opaque (today's look). Below 1 the
-                             # tagbox/pin background turns see-through, outlines
-                             # and text keep most of their opacity (ALPHA_WEIGHTS
-                             # below). Multiplies the plugin's "Marker Opacity".
+    "markerAlpha": 1.0,      # overlay-side dimmer, multiplied into the plugin's
+                             # "Marker Opacity" (0.35 by default from 1.2.2). Left
+                             # at 1.0 here so the shipped look is the plugin value
+                             # alone; below 1 the tagbox/pin background opens up
+                             # further while outlines and text keep their opacity
+                             # (ALPHA_WEIGHTS above).
     "edgeSize": 24,          # EdgeArrowSize [px]: arrow long side at scale 1
     "iconScale": 1.0,        # symbol multiplier: pin geometry + kind icon
                              # (text stays readable). 1.0 is the standard size

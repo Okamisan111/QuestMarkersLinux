@@ -184,7 +184,7 @@ menu; edit the file (game closed, see [Token changes](#the-feed-token)).
 | `Display / Imperial Units` | off | feet and miles |
 | `Display / Edge Arrow Size` | 24 px | arrow size at scale 1.0 |
 | `Display / Icon Scale` | 1.0 | symbol size multiplier |
-| `Display / Marker Opacity` | 1.0 | see-through markers, 0.05 = watermark, see [semi-transparent markers](#semi-transparent-markers) |
+| `Display / Marker Opacity` | 0.35 | see-through markers, 1.0 = fully opaque, 0.05 = watermark, see [semi-transparent markers](#semi-transparent-markers) |
 | `Debug / Debug Log` | off | verbose scan/feed logging |
 
 #### Advanced settings (Better BepInEx)
@@ -247,8 +247,9 @@ purpose.
 
 ### Semi-transparent markers
 
-Two knobs multiply: the plugin's `Display / Marker Opacity` (0.05 … 1.0, sent
-as `op` in every marker) and the overlay's `markerAlpha` in `config.json`. The
+Two knobs multiply: the plugin's `Display / Marker Opacity` (0.05 … 1.0, default
+0.35, sent as `op` in every marker) and the overlay's `markerAlpha` in
+`config.json` (default 1.0, so the shipped look is the plugin value alone). The
 overlay then gives every part of a marker its own share of what is left,
 `layer alpha = 1 − (1 − opacity) × weight`:
 
@@ -260,11 +261,19 @@ overlay then gives every part of a marker its own share of what is left,
 | distance text | 0.08 | A244 |
 | quest label | 0.00 | A255 (A249 … A253 while a marker moves, sub-pixel resampling) |
 
+At the shipped default 0.35 those weights land at A89 for the tagbox plate and
+the pin fill, A172 for the outlines, A205 for the kind icon, A242 for the
+distance text and A255 for the quest label (tier formula, not a screen
+measurement - the 0.45 column above was read off the composited marker).
+
 A flat 1:1 fade would wash the text out before the background becomes
 see-through, so text and outlines are deliberately protected. `op = 1.0`
-(the default, and what a plugin older than this change sends) reproduces the
-previous look pixel for pixel. Below `op = 0.01` a marker is dropped instead of
-drawn invisibly, and hostile config values are clamped on both sides.
+(raise the knob to it; it is also what a plugin older than 1.2.2 sends, because
+it sends no `op` at all) reproduces the previous fully opaque look pixel for
+pixel. Below `op = 0.01` a marker is dropped instead of drawn invisibly, and
+hostile config values are clamped on both sides. An existing BepInEx config keeps
+whatever value it already wrote, so an install that ran 1.2.1 once still reads
+`Marker Opacity = 1` until the entry is deleted or lowered.
 
 Measured on KWin/KDE with the Wayland presenter, covered and above native
 resolution. On a compositor that blends layer surfaces differently the result
@@ -388,7 +397,7 @@ placeholder `config.example.json` is tracked.
 | Labels in a boring font | Chakra Petch not installed | install it or set `"font": ""` |
 | Markers freeze on screen | feed went quiet > 1 s | expected: the overlay clears itself; check the game/plugin log |
 | Feed works, markers jitter | very low game FPS | the smoother interpolates real measurements; lower `hz` rarely helps, see [Under the hood](#under-the-hood) |
-| Markers look washed out or too faint | `Marker Opacity` / `markerAlpha` lowered, or a compositor that blends layer surfaces differently | set both back to 1.0; the tier table is in [semi-transparent markers](#semi-transparent-markers) |
+| Markers look washed out or too faint | `Marker Opacity` at its 0.35 default (or lower), `markerAlpha` lowered, or a compositor that blends layer surfaces differently | raise `Marker Opacity` to 1.0 for the fully opaque look; the tier table is in [semi-transparent markers](#semi-transparent-markers) |
 | Markers appear on the wrong monitor | several outputs and no monitor pinned | `overlay.py --list-monitors`, then `--monitor` (or `monitor` in `config.json`) with the value it prints |
 
 Still stuck? `--debug` gives per-frame stats, `--trace out.jsonl` gives every
